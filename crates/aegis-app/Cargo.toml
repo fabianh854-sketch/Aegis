@@ -7,3 +7,4 @@ version.workspace = true
 aegis-core = { path = "../aegis-core" }
 eframe = "0.29"
 zeroize = "1"
+getrandom = "0.2"

@@ -1,16 +1,69 @@
-use std::{fs, path::PathBuf};
+use std::{fs, mem, path::PathBuf, time::{Duration, Instant}};
 
 use aegis_core::{Entry, Vault};
-use eframe::egui;
+use eframe::egui::{
+    self, Align, Align2, FontId, Layout, Margin, Pos2, Rect, RichText, Rounding, Sense, Stroke,
+    UiBuilder, ViewportCommand,
+};
 use zeroize::Zeroizing;
+
+use crate::{generator, theme};
+
+const AUTO_LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
+const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
+const STATUS_VISIBLE_FOR: Duration = Duration::from_secs(4);
+const TITLE_BAR_HEIGHT: f32 = 40.0;
+const SIDEBAR_OPEN_WIDTH: f32 = 220.0;
+const SIDEBAR_CLOSED_WIDTH: f32 = 56.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Nav {
+    Entries,
+    Generator,
+    Settings,
+}
+
+/// Geöffneter Eintrag. `index` ist `None` für einen neuen Eintrag.
+struct Editor {
+    index: Option<usize>,
+    entry: Entry,
+    reveal: bool,
+    confirm_delete: bool,
+}
+
+struct Settings {
+    auto_lock: bool,
+    clear_clipboard: bool,
+}
 
 pub struct AegisApp {
     path: PathBuf,
-    password: String,                  // Eingabefeld, nach dem Entsperren geleert
-    master: Option<Zeroizing<String>>, // Master-Passwort für Speichervorgänge
+    // Entsperren
+    password: String,
+    confirm: String,
+    /// Formular „Neu anlegen“ ist offen. Nur möglich, solange keine Tresor-Datei existiert.
+    creating: bool,
+    // Sitzung
+    master: Option<Zeroizing<String>>,
     vault: Option<Vault>,
-    new_title: String,
+    nav: Nav,
+    sidebar_open: bool,
+    search: String,
+    focus_search: bool,
+    editor: Option<Editor>,
     status: String,
+    status_error: bool,
+    status_at: Instant,
+    last_activity: Instant,
+    clipboard_clear_at: Option<Instant>,
+    // Passwortgenerator
+    gen_opts: generator::Options,
+    gen_password: String,
+    // Einstellungen
+    settings: Settings,
+    show_master_form: bool,
+    new_master: String,
+    new_master_confirm: String,
 }
 
 impl Default for AegisApp {
@@ -18,117 +71,1020 @@ impl Default for AegisApp {
         let base = std::env::var("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
+        let gen_opts = generator::Options::default();
+        let gen_password = generator::generate(&gen_opts).unwrap_or_default();
         Self {
             path: base.join("Aegis").join("vault.aegis"),
             password: String::new(),
+            confirm: String::new(),
+            creating: false,
             master: None,
             vault: None,
-            new_title: String::new(),
+            nav: Nav::Entries,
+            sidebar_open: true,
+            search: String::new(),
+            focus_search: false,
+            editor: None,
             status: String::new(),
+            status_error: false,
+            status_at: Instant::now(),
+            last_activity: Instant::now(),
+            clipboard_clear_at: None,
+            gen_opts,
+            gen_password,
+            settings: Settings { auto_lock: true, clear_clipboard: true },
+            show_master_form: false,
+            new_master: String::new(),
+            new_master_confirm: String::new(),
         }
     }
 }
 
 impl eframe::App for AegisApp {
+    /// Transparent, damit die runden Fensterecken des Entwurfs sichtbar sind.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.vault.is_some() {
-                self.list_view(ui);
+        let now = Instant::now();
+        if ctx.input(|i| !i.events.is_empty()) {
+            self.last_activity = now;
+        }
+
+        if self.vault.is_some() {
+            if self.settings.auto_lock && now.duration_since(self.last_activity) >= AUTO_LOCK_AFTER {
+                self.lock();
+                self.set_status("Automatisch gesperrt", false);
             } else {
-                self.unlock_view(ui);
+                ctx.request_repaint_after(Duration::from_secs(10));
+            }
+        }
+
+        // Hinweise wie „Gespeichert“ verschwinden nach ein paar Sekunden, Fehler bleiben stehen.
+        if !self.status.is_empty() && !self.status_error && self.vault.is_some() {
+            let shown = now.duration_since(self.status_at);
+            if shown >= STATUS_VISIBLE_FOR {
+                self.status.clear();
+            } else {
+                ctx.request_repaint_after(STATUS_VISIBLE_FOR - shown);
+            }
+        }
+
+        if let Some(at) = self.clipboard_clear_at {
+            if now >= at {
+                ctx.copy_text(String::new());
+                self.clipboard_clear_at = None;
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
+
+        // Ein Fenster ohne Windows-Rahmen: eigener Rand mit Radius 12 und eigene Titelleiste.
+        let window = egui::Frame::none()
+            .fill(theme::PANEL)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .rounding(Rounding::same(12.0));
+        egui::CentralPanel::default().frame(window).show(ctx, |ui| {
+            let app_rect = ui.max_rect();
+            let title_rect = Rect::from_min_size(app_rect.min, egui::vec2(app_rect.width(), TITLE_BAR_HEIGHT));
+            let unlocked = self.vault.is_some();
+            let status = if unlocked { self.status.as_str() } else { "" };
+            title_bar(ui, title_rect, status, self.status_error);
+
+            let content = Rect::from_min_max(egui::pos2(app_rect.left(), title_rect.bottom()), app_rect.max);
+            let mut content_ui = ui.new_child(UiBuilder::new().max_rect(content).layout(Layout::top_down(Align::Min)));
+            if unlocked {
+                self.main_view(&mut content_ui);
+            } else {
+                self.unlock_view(&mut content_ui);
             }
         });
     }
 }
 
 impl AegisApp {
-    fn unlock_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Aegis entsperren");
-
-        let field = ui.add(
-            egui::TextEdit::singleline(&mut self.password)
-                .password(true)
-                .hint_text("Master-Passwort"),
-        );
-        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-        if ui.button("Entsperren").clicked() || enter {
-            self.unlock();
-        }
-        ui.label(&self.status);
-    }
-
-    fn unlock(&mut self) {
-        if self.password.is_empty() {
-            self.status = "Bitte Master-Passwort eingeben".into();
-            return;
-        }
-
-        let result = if self.path.exists() {
-            aegis_core::load(&self.path, self.password.as_bytes())
-        } else {
-            // Erststart: leeren Vault mit diesem Passwort anlegen
-            if let Some(dir) = self.path.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            aegis_core::save(&self.path, self.password.as_bytes(), &Vault::default())
-                .map(|_| Vault::default())
-        };
-
-        match result {
-            Ok(vault) => {
-                self.vault = Some(vault);
-                self.master = Some(Zeroizing::new(std::mem::take(&mut self.password)));
-                self.status.clear();
-            }
-            Err(e) => self.status = e.to_string(),
-        }
+    fn set_status(&mut self, text: impl Into<String>, error: bool) {
+        self.status = text.into();
+        self.status_error = error;
+        self.status_at = Instant::now();
     }
 
     fn lock(&mut self) {
         self.vault = None;
         self.master = None;
+        self.editor = None;
         self.password.clear();
+        self.confirm.clear();
+        self.search.clear();
+        self.new_master.clear();
+        self.new_master_confirm.clear();
+        self.show_master_form = false;
         self.status.clear();
+        self.nav = Nav::Entries;
     }
 
-    fn add_entry(&mut self) {
-        let (Some(vault), Some(master)) = (self.vault.as_mut(), self.master.as_ref()) else {
+    // ---- Entsperren (Entwurf 01) -------------------------------------------
+
+    fn unlock_view(&mut self, ui: &mut egui::Ui) {
+        let exists = self.path.exists();
+        let creating = self.creating && !exists;
+
+        // Spalte 320 px breit, senkrecht und waagerecht mittig.
+        let height = if creating { 390.0 } else { 310.0 };
+        let column = Rect::from_center_size(ui.max_rect().center(), egui::vec2(320.0, height));
+        let mut ui = ui.new_child(UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)));
+        ui.spacing_mut().item_spacing.y = 8.0;
+
+        ui.vertical_centered(|ui| {
+            let title = if creating { "Tresor anlegen" } else { "Unlock Vault" };
+            ui.label(theme::heading(title, 34.0));
+        });
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("Dein Master-Passwort öffnet den Tresor. Er bleibt lokal auf diesem Gerät.")
+                .size(14.0)
+                .color(theme::MUTED),
+        );
+        ui.add_space(16.0);
+
+        ui.label(theme::muted("Master-Passwort", 13.0));
+        let first = ui.add(password_input(&mut self.password));
+        let mut enter = first.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        if creating {
+            ui.add_space(4.0);
+            ui.label(theme::muted("Passwort bestätigen", 13.0));
+            let second = ui.add(password_input(&mut self.confirm));
+            enter |= second.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        }
+        ui.add_space(12.0);
+
+        let label = if creating { "Tresor anlegen" } else { "Entsperren" };
+        let button = egui::Button::new(theme::medium(label, 15.0).color(theme::ACCENT_TEXT))
+            .fill(theme::ACCENT)
+            .stroke(Stroke::NONE)
+            .min_size(egui::vec2(320.0, 44.0));
+        // Text mittig: egui richtet Button-Text nach dem Layout aus.
+        let clicked = ui.vertical_centered_justified(|ui| ui.add(button).clicked()).inner;
+        if clicked || enter {
+            self.unlock(creating);
+        }
+        ui.add_space(12.0);
+
+        // „Neu anlegen“ nur, solange es keinen Tresor gibt. Sonst würde ein bestehender überschrieben.
+        if creating {
+            if ui.add(theme::link_button("Zurück zum Entsperren", theme::MUTED, 13.0)).clicked() {
+                self.creating = false;
+                self.confirm.clear();
+                self.status.clear();
+            }
+        } else if !exists
+            && ui.add(theme::link_button("Noch kein Tresor? Neu anlegen", theme::ACCENT, 13.0)).clicked()
+        {
+            self.creating = true;
+            self.status.clear();
+        }
+
+        if !self.status.is_empty() {
+            ui.add_space(4.0);
+            let color = if self.status_error { theme::DANGER } else { theme::MUTED };
+            ui.label(RichText::new(&self.status).size(13.0).color(color));
+        }
+    }
+
+    fn unlock(&mut self, creating: bool) {
+        if self.password.is_empty() {
+            self.set_status("Bitte Master-Passwort eingeben", true);
             return;
+        }
+        let exists = self.path.exists();
+
+        let result = if creating {
+            if exists {
+                self.set_status("Es gibt bereits einen Tresor", true);
+                return;
+            }
+            if self.password != self.confirm {
+                self.set_status("Die Passwörter stimmen nicht überein", true);
+                return;
+            }
+            if let Some(dir) = self.path.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            aegis_core::save(&self.path, self.password.as_bytes(), &Vault::default())
+                .map(|_| Vault::default())
+        } else {
+            if !exists {
+                self.set_status("Noch kein Tresor vorhanden. Lege zuerst einen an.", true);
+                return;
+            }
+            aegis_core::load(&self.path, self.password.as_bytes())
         };
 
-        vault.entries.push(Entry {
-            title: std::mem::take(&mut self.new_title),
-            ..Default::default()
-        });
-
-        self.status = match aegis_core::save(&self.path, master.as_bytes(), vault) {
-            Ok(()) => "Gespeichert".into(),
-            Err(e) => e.to_string(),
-        };
+        match result {
+            Ok(vault) => {
+                self.vault = Some(vault);
+                self.master = Some(Zeroizing::new(mem::take(&mut self.password)));
+                self.confirm.clear();
+                self.creating = false;
+                self.nav = Nav::Entries;
+                self.last_activity = Instant::now();
+                self.status.clear();
+            }
+            Err(e) => self.set_status(e.to_string(), true),
+        }
     }
 
-    fn list_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Einträge");
+    // ---- Hauptansicht ------------------------------------------------------
 
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.new_title);
-            if ui.button("Hinzufügen").clicked() && !self.new_title.is_empty() {
-                self.add_entry();
+    fn main_view(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        // Der Eintrag (Entwurf 03) hat keine Seitenleiste, die Übersichten schon.
+        let sidebar_width = match (self.editor.is_some(), self.sidebar_open) {
+            (true, _) => 0.0,
+            (false, true) => SIDEBAR_OPEN_WIDTH,
+            (false, false) => SIDEBAR_CLOSED_WIDTH,
+        };
+        if sidebar_width > 0.0 {
+            let side = Rect::from_min_size(rect.min, egui::vec2(sidebar_width, rect.height()));
+            let mut side_ui = ui.new_child(UiBuilder::new().max_rect(side).layout(Layout::top_down(Align::Min)));
+            self.sidebar(&mut side_ui);
+        }
+
+        let main = Rect::from_min_max(egui::pos2(rect.left() + sidebar_width, rect.top()), rect.max);
+        let padding = if self.editor.is_none() && self.nav == Nav::Generator {
+            egui::vec2(32.0, 22.0)
+        } else {
+            egui::vec2(32.0, 28.0)
+        };
+        let mut main_ui = ui.new_child(
+            UiBuilder::new().max_rect(main.shrink2(padding)).layout(Layout::top_down(Align::Min)),
+        );
+        if self.vault.is_none() {
+            return;
+        }
+        if self.editor.is_some() {
+            self.editor_view(&mut main_ui);
+        } else {
+            match self.nav {
+                Nav::Entries => self.entries_view(&mut main_ui),
+                Nav::Generator => self.generator_view(&mut main_ui),
+                Nav::Settings => self.settings_view(&mut main_ui),
             }
-            if ui.button("Sperren").clicked() {
-                self.lock();
-            }
-        });
+        }
+    }
 
-        ui.separator();
+    /// Seitenleiste (Entwurf 02 aufgeklappt, 02b eingeklappt).
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let open = self.sidebar_open;
+        let outer = ui.max_rect();
+        let inner = if open { outer.shrink2(egui::vec2(14.0, 20.0)) } else { outer.shrink2(egui::vec2(10.0, 20.0)) };
+        let mut ui = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
 
-        if let Some(vault) = &self.vault {
-            for entry in &vault.entries {
-                ui.label(&entry.title);
+        // Auf-/Zuklappen: Kästchen 28 px mit ‹ bzw. ›
+        let chevron = if open {
+            Rect::from_min_size(egui::pos2(inner.right() - 6.0 - 28.0, inner.top()), egui::vec2(28.0, 28.0))
+        } else {
+            Rect::from_min_size(egui::pos2(inner.center().x - 14.0, inner.top()), egui::vec2(28.0, 28.0))
+        };
+        let response = ui.interact(chevron, egui::Id::new("sidebar_toggle"), Sense::click());
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(chevron, 6.0, theme::SURFACE_HI);
+        }
+        painter.rect_stroke(chevron, 6.0, Stroke::new(1.0, theme::BORDER));
+        painter.text(
+            chevron.center(),
+            Align2::CENTER_CENTER,
+            if open { "‹" } else { "›" },
+            FontId::proportional(16.0),
+            theme::MUTED,
+        );
+        if response.clicked() {
+            self.sidebar_open = !open;
+        }
+        // Abstand unter dem Kästchen: aufgeklappt 18 px, eingeklappt 10 + 14 px Zwischenraum.
+        ui.add_space(28.0 + if open { 18.0 } else { 24.0 });
+
+        ui.spacing_mut().item_spacing.y = if open { 2.0 } else { 10.0 };
+        if !open && nav_button(&mut ui, false, Icon::Search, "Suchen", open) {
+            self.nav = Nav::Entries;
+            self.focus_search = true;
+        }
+        let items = [
+            (Nav::Entries, Icon::List, "Alle Einträge"),
+            (Nav::Generator, Icon::Key, "Passwortgenerator"),
+            (Nav::Settings, Icon::Sliders, "Einstellungen"),
+        ];
+        for (nav, icon, label) in items {
+            if nav_button(&mut ui, self.nav == nav, icon, label, open) {
+                self.nav = nav;
             }
         }
 
-        ui.label(&self.status);
+        let lock_width = if open { inner.width() } else { 36.0 };
+        let lock_rect = Rect::from_min_size(egui::pos2(inner.left(), inner.bottom() - 36.0), egui::vec2(lock_width, 36.0));
+        let mut lock_ui = ui.new_child(UiBuilder::new().max_rect(lock_rect));
+        if nav_button(&mut lock_ui, false, Icon::Lock, "Sperren", open) {
+            self.lock();
+        }
     }
+
+    // ---- Einträge (Entwurf 02) ---------------------------------------------
+
+    fn entries_view(&mut self, ui: &mut egui::Ui) {
+        let query = self.search.to_lowercase();
+        let rows: Vec<(usize, String, String)> = match &self.vault {
+            Some(vault) => vault
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    query.is_empty()
+                        || e.title.to_lowercase().contains(&query)
+                        || e.username.to_lowercase().contains(&query)
+                })
+                .map(|(i, e)| (i, e.title.clone(), e.username.clone()))
+                .collect(),
+            None => return,
+        };
+
+        let mut open_index = None;
+        let mut new_entry = false;
+        ui.horizontal(|ui| {
+            ui.set_min_height(36.0);
+            ui.label(theme::heading("Einträge", 28.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(theme::accent_button("+ Neuer Eintrag")).clicked() {
+                    new_entry = true;
+                }
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text(theme::muted("Suchen", 13.0))
+                        .font(FontId::proportional(13.0))
+                        .margin(Margin::symmetric(10.0, 9.0))
+                        .desired_width(200.0),
+                );
+                if self.focus_search {
+                    search.request_focus();
+                    self.focus_search = false;
+                }
+            });
+        });
+        ui.add_space(12.0);
+
+        if rows.is_empty() {
+            let text = if self.search.is_empty() { "Noch keine Einträge" } else { "Keine Treffer" };
+            ui.label(theme::muted(text, 14.0));
+        } else {
+            egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .rounding(Rounding::same(12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let last = rows.len() - 1;
+                        for (n, (index, title, username)) in rows.iter().enumerate() {
+                            // Platzhalter für den Hover-Hintergrund, damit er hinter dem Inhalt liegt.
+                            let background = ui.painter().add(egui::Shape::Noop);
+                            let row = egui::Frame::none()
+                                .inner_margin(Margin::symmetric(16.0, 14.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 14.0;
+                                        avatar(ui, title);
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 2.0;
+                                            ui.label(theme::medium(title.as_str(), 15.0));
+                                            ui.label(theme::muted(username.as_str(), 13.0));
+                                        });
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            let details = egui::Button::new(RichText::new("Details").size(13.0))
+                                                .fill(egui::Color32::TRANSPARENT)
+                                                .stroke(Stroke::new(1.0, theme::BORDER))
+                                                .min_size(egui::vec2(0.0, 30.0));
+                                            if ui.add(details).clicked() {
+                                                open_index = Some(*index);
+                                            }
+                                        });
+                                    });
+                                })
+                                .response;
+
+                            let rect = row.rect;
+                            if ui.rect_contains_pointer(rect) {
+                                let top = if n == 0 { 11.0 } else { 0.0 };
+                                let bottom = if n == last { 11.0 } else { 0.0 };
+                                let rounding = Rounding { nw: top, ne: top, sw: bottom, se: bottom };
+                                ui.painter().set(
+                                    background,
+                                    egui::epaint::RectShape::filled(rect, rounding, theme::SURFACE_HI),
+                                );
+                            }
+                            if n < last {
+                                ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, theme::BORDER));
+                            }
+                        }
+                    });
+            });
+        }
+
+        if let Some(index) = open_index {
+            self.open_editor(Some(index));
+        }
+        if new_entry {
+            self.open_editor(None);
+        }
+    }
+
+    fn open_editor(&mut self, index: Option<usize>) {
+        let entry = match (index, &self.vault) {
+            (Some(i), Some(vault)) => vault.entries[i].clone(),
+            _ => Entry::default(),
+        };
+        self.editor = Some(Editor { index, entry, reveal: false, confirm_delete: false });
+    }
+
+    // ---- Eintrag (Entwurf 03) ----------------------------------------------
+
+    fn editor_view(&mut self, ui: &mut egui::Ui) {
+        let is_new = self.editor.as_ref().is_none_or(|e| e.index.is_none());
+        // Überschrift ist der Eintragstitel, wie im Entwurf.
+        let heading = match self.editor.as_ref() {
+            Some(e) if !e.entry.title.trim().is_empty() => e.entry.title.clone(),
+            _ => "Neuer Eintrag".to_string(),
+        };
+        let mut save = false;
+        let mut cancel = false;
+        let mut delete = false;
+
+        ui.horizontal(|ui| {
+            ui.set_min_height(36.0);
+            ui.label(theme::heading(heading, 28.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui.add(theme::accent_button("Speichern")).clicked() {
+                    save = true;
+                }
+                if ui.add(theme::secondary_button("Abbrechen")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        ui.add_space(14.0);
+
+        let Some(editor) = self.editor.as_mut() else { return };
+
+        // Titel und Benutzername nebeneinander, 20 px Abstand.
+        let gap = 20.0;
+        let column = (ui.available_width() - gap) / 2.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            ui.vertical(|ui| {
+                ui.set_width(column);
+                ui.label(theme::muted("Titel", 13.0));
+                ui.add(theme::input(&mut editor.entry.title));
+            });
+            ui.vertical(|ui| {
+                ui.set_width(column);
+                ui.label(theme::muted("Benutzername", 13.0));
+                ui.add(theme::input(&mut editor.entry.username));
+            });
+        });
+        ui.add_space(14.0);
+
+        // Passwort: „Kopieren“ rechts über dem Feld, „Anzeigen“ im Feld.
+        ui.horizontal(|ui| {
+            ui.label(theme::muted("Passwort", 13.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(14.0);
+                if ui.add(theme::link_button("Kopieren", theme::ACCENT, 13.0)).clicked() {
+                    ui.ctx().copy_text(editor.entry.password.clone());
+                    if self.settings.clear_clipboard {
+                        self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
+                    }
+                }
+            });
+        });
+        let password_id = egui::Id::new("entry_password");
+        let focused = ui.memory(|m| m.has_focus(password_id));
+        egui::Frame::none()
+            .fill(theme::SURFACE)
+            .stroke(Stroke::new(1.0, if focused { theme::ACCENT } else { theme::BORDER }))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(14.0, 12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let width = ui.available_width() - 70.0;
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.entry.password)
+                            .id(password_id)
+                            .frame(false)
+                            .margin(Margin::ZERO)
+                            .password(!editor.reveal)
+                            .font(FontId::monospace(15.0))
+                            .desired_width(width),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = if editor.reveal { "Verbergen" } else { "Anzeigen" };
+                        if ui.add(theme::link_button(label, theme::TEXT, 13.0)).clicked() {
+                            editor.reveal = !editor.reveal;
+                        }
+                    });
+                });
+            });
+        ui.add_space(4.0);
+        strength_bars(ui, &editor.entry.password, 44.0);
+        ui.add_space(14.0);
+
+        ui.label(theme::muted("Notizen", 13.0));
+        let notes_height = (ui.available_height() - if is_new { 8.0 } else { 40.0 }).max(80.0);
+        ui.add(
+            egui::TextEdit::multiline(&mut editor.entry.notes)
+                .font(FontId::proportional(14.0))
+                .margin(Margin::symmetric(14.0, 12.0))
+                .desired_width(f32::INFINITY)
+                .min_size(egui::vec2(0.0, notes_height)),
+        );
+
+        if !is_new {
+            ui.add_space(12.0);
+            let label = if editor.confirm_delete { "Wirklich löschen?" } else { "Löschen" };
+            if ui.add(theme::link_button(label, theme::DANGER, 14.0)).clicked() {
+                if editor.confirm_delete {
+                    delete = true;
+                } else {
+                    editor.confirm_delete = true;
+                }
+            }
+        }
+
+        if cancel {
+            self.editor = None;
+            self.status.clear();
+        }
+        if save {
+            self.save_editor();
+        }
+        if delete {
+            self.delete_editor_entry();
+        }
+    }
+
+    /// Schreibt den Eintrag auf einer Kopie des Vaults und übernimmt ihn erst nach erfolgreichem Speichern.
+    fn save_editor(&mut self) {
+        let Some(editor) = self.editor.as_ref() else { return };
+        if editor.entry.title.trim().is_empty() {
+            self.set_status("Bitte einen Titel eingeben", true);
+            return;
+        }
+        let Some(current) = self.vault.as_ref() else { return };
+        let mut candidate = current.clone();
+        let entry = editor.entry.clone();
+        match editor.index {
+            Some(i) => candidate.entries[i] = entry,
+            None => candidate.entries.push(entry),
+        }
+        if self.commit(candidate) {
+            self.editor = None;
+            self.set_status("Gespeichert", false);
+        }
+    }
+
+    fn delete_editor_entry(&mut self) {
+        let Some(index) = self.editor.as_ref().and_then(|e| e.index) else { return };
+        let Some(current) = self.vault.as_ref() else { return };
+        let mut candidate = current.clone();
+        candidate.entries.remove(index);
+        if self.commit(candidate) {
+            self.editor = None;
+            self.set_status("Eintrag gelöscht", false);
+        }
+    }
+
+    /// Speichert `candidate` auf die Platte und macht es nur bei Erfolg zum aktuellen Vault.
+    fn commit(&mut self, candidate: Vault) -> bool {
+        let Some(master) = self.master.as_ref() else { return false };
+        match aegis_core::save(&self.path, master.as_bytes(), &candidate) {
+            Ok(()) => {
+                self.vault = Some(candidate);
+                true
+            }
+            Err(e) => {
+                self.set_status(format!("Speichern fehlgeschlagen: {e}"), true);
+                false
+            }
+        }
+    }
+
+    // ---- Passwortgenerator (Entwurf 04) ------------------------------------
+
+    fn regenerate(&mut self) {
+        self.gen_password = generator::generate(&self.gen_opts).unwrap_or_default();
+    }
+
+    fn generator_view(&mut self, ui: &mut egui::Ui) {
+        let mut regenerate = false;
+        ui.label(theme::heading("Passwortgenerator", 28.0));
+        ui.add_space(4.0);
+
+        theme::plain_card(theme::SURFACE_HI, Margin::same(18.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 14.0;
+            let shown = if self.gen_password.is_empty() {
+                "Mindestens eine Zeichengruppe wählen".to_string()
+            } else {
+                self.gen_password.clone()
+            };
+            ui.label(RichText::new(shown).size(22.0).family(theme::mono_medium()));
+            ui.horizontal(|ui| {
+                // Balken auf Höhe der 36 px hohen Buttons.
+                ui.vertical(|ui| {
+                    ui.add_space(16.0);
+                    strength_bars(ui, &self.gen_password, 40.0);
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.add(theme::accent_button("Kopieren")).clicked() && !self.gen_password.is_empty() {
+                        ui.ctx().copy_text(self.gen_password.clone());
+                        if self.settings.clear_clipboard {
+                            self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
+                        }
+                    }
+                    if ui.add(theme::secondary_button("Neu erzeugen")).clicked() {
+                        regenerate = true;
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
+
+        ui.spacing_mut().item_spacing.y = 0.0;
+        regenerate |= length_slider(ui, &mut self.gen_opts.length, 12, 32);
+        regenerate |= toggle_row(ui, "Großbuchstaben", None, &mut self.gen_opts.upper, 40.0);
+        regenerate |= toggle_row(ui, "Kleinbuchstaben", None, &mut self.gen_opts.lower, 40.0);
+        regenerate |= toggle_row(ui, "Zahlen", None, &mut self.gen_opts.digits, 40.0);
+        regenerate |= toggle_row(ui, "Symbole", None, &mut self.gen_opts.symbols, 40.0);
+        regenerate |= toggle_row(
+            ui,
+            "Mehrdeutige Zeichen ausschließen",
+            None,
+            &mut self.gen_opts.exclude_ambiguous,
+            40.0,
+        );
+
+        if regenerate {
+            self.regenerate();
+        }
+    }
+
+    // ---- Einstellungen (Entwurf 05) ----------------------------------------
+
+    fn settings_view(&mut self, ui: &mut egui::Ui) {
+        let mut change_master = false;
+        ui.label(theme::heading("Einstellungen", 28.0));
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            toggle_row(
+                ui,
+                "Automatisch sperren",
+                Some("Nach 5 Minuten Inaktivität"),
+                &mut self.settings.auto_lock,
+                72.0,
+            );
+            toggle_row(
+                ui,
+                "Zwischenablage nach 30 Sekunden leeren",
+                None,
+                &mut self.settings.clear_clipboard,
+                52.0,
+            );
+
+            ui.horizontal(|ui| {
+                ui.set_min_height(66.0);
+                ui.label(RichText::new("Master-Passwort ändern").size(15.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let button = theme::secondary_button("Master-Passwort ändern").min_size(egui::vec2(0.0, 34.0));
+                    if ui.add(button).clicked() {
+                        self.show_master_form = !self.show_master_form;
+                    }
+                });
+            });
+            if self.show_master_form {
+                theme::card().show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.add(password_input(&mut self.new_master).hint_text(theme::muted("Neues Master-Passwort", 15.0)));
+                    ui.add(password_input(&mut self.new_master_confirm).hint_text(theme::muted("Wiederholen", 15.0)));
+                    if ui.add(theme::accent_button("Speichern")).clicked() {
+                        change_master = true;
+                    }
+                });
+            }
+
+            ui.horizontal(|ui| {
+                ui.set_min_height(52.0);
+                ui.label(RichText::new("Speicherort").size(15.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(theme::muted("%APPDATA%\\Aegis\\vault.aegis", 13.0).monospace());
+                });
+            });
+            ui.add_space(16.0);
+
+            theme::plain_card(theme::SURFACE, Margin::symmetric(20.0, 18.0)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.label(theme::muted("Verschlüsselung", 13.0));
+                ui.label(RichText::new("Argon2id zur Schlüsselableitung, XChaCha20-Poly1305 zur Verschlüsselung").size(14.0));
+                ui.label(theme::muted("vault.aegis · AEGS · v1", 13.0).monospace());
+            });
+        });
+
+        if change_master {
+            self.change_master();
+        }
+    }
+
+    fn change_master(&mut self) {
+        if self.new_master.is_empty() {
+            self.set_status("Bitte ein neues Passwort eingeben", true);
+            return;
+        }
+        if self.new_master != self.new_master_confirm {
+            self.set_status("Die Passwörter stimmen nicht überein", true);
+            return;
+        }
+        let Some(vault) = self.vault.as_ref() else { return };
+        match aegis_core::save(&self.path, self.new_master.as_bytes(), vault) {
+            Ok(()) => {
+                self.master = Some(Zeroizing::new(mem::take(&mut self.new_master)));
+                self.new_master_confirm.clear();
+                self.show_master_form = false;
+                self.set_status("Master-Passwort geändert", false);
+            }
+            Err(e) => self.set_status(format!("Speichern fehlgeschlagen: {e}"), true),
+        }
+    }
+}
+
+// ---- Fenster-Titelleiste ---------------------------------------------------
+
+/// Titelleiste wie im Entwurf: Logo und „Aegis“ links, Minimieren und Schließen rechts.
+/// Ein Statushinweis (z. B. „Gespeichert“) steht links neben den Fensterknöpfen.
+fn title_bar(ui: &mut egui::Ui, rect: Rect, status: &str, status_error: bool) {
+    let drag = ui.interact(rect, egui::Id::new("title_bar"), Sense::click_and_drag());
+    if drag.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+
+    let close_rect = Rect::from_min_size(egui::pos2(rect.right() - 46.0, rect.top()), egui::vec2(46.0, rect.height()));
+    let min_rect = close_rect.translate(egui::vec2(-46.0, 0.0));
+    let close = ui.interact(close_rect, egui::Id::new("title_close"), Sense::click());
+    let minimize = ui.interact(min_rect, egui::Id::new("title_minimize"), Sense::click());
+
+    let painter = ui.painter();
+    let logo = Rect::from_min_size(egui::pos2(rect.left() + 14.0, rect.center().y - 7.0), egui::vec2(14.0, 14.0));
+    painter.rect_filled(logo, 4.0, theme::ACCENT);
+    painter.text(
+        egui::pos2(logo.right() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Aegis",
+        FontId::proportional(12.0),
+        theme::MUTED,
+    );
+
+    if !status.is_empty() {
+        let color = if status_error { theme::DANGER } else { theme::MUTED };
+        painter.text(
+            egui::pos2(min_rect.left() - 12.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            status,
+            FontId::proportional(12.0),
+            color,
+        );
+    }
+
+    if minimize.hovered() {
+        painter.rect_filled(min_rect, 0.0, theme::SURFACE_HI);
+    }
+    if close.hovered() {
+        let rounding = Rounding { ne: 12.0, ..Rounding::ZERO };
+        painter.rect_filled(close_rect, rounding, theme::DANGER.gamma_multiply(0.35));
+    }
+    let line = Stroke::new(1.0, theme::TEXT);
+    let c = min_rect.center();
+    painter.line_segment([c - egui::vec2(5.0, 0.0), c + egui::vec2(5.0, 0.0)], line);
+    let c = close_rect.center();
+    painter.line_segment([c + egui::vec2(-6.0, -6.0), c + egui::vec2(6.0, 6.0)], line);
+    painter.line_segment([c + egui::vec2(-6.0, 6.0), c + egui::vec2(6.0, -6.0)], line);
+
+    if minimize.clicked() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+    }
+    if close.clicked() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+    }
+}
+
+// ---- Kleine Bausteine ------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Search,
+    List,
+    Key,
+    Sliders,
+    Lock,
+}
+
+/// Eintrag der Seitenleiste: 36 px hoch, Symbol links, Text 14 px. Eingeklappt nur das Symbol.
+fn nav_button(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str, open: bool) -> bool {
+    let width = if open { ui.available_width() } else { 36.0 };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 36.0), Sense::click());
+    // Sperren ist im Entwurf rot markiert.
+    let color = match icon {
+        Icon::Lock => theme::DANGER,
+        _ if selected => theme::TEXT,
+        _ => theme::MUTED,
+    };
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 8.0, theme::SURFACE_HI);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 8.0, theme::SURFACE);
+    }
+
+    let center = if open { egui::pos2(rect.left() + 18.0, rect.center().y) } else { rect.center() };
+    draw_icon(painter, icon, center, color);
+    if open {
+        painter.text(
+            egui::pos2(rect.left() + 36.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(14.0),
+            color,
+        );
+    }
+    response.on_hover_text(label).clicked()
+}
+
+/// Zeichnet die Symbole des Entwurfs (dort aus CSS-Formen gebaut) mit Linien und Kreisen nach.
+fn draw_icon(painter: &egui::Painter, icon: Icon, c: Pos2, color: egui::Color32) {
+    let stroke = Stroke::new(1.5, color);
+    let p = |dx: f32, dy: f32| egui::pos2(c.x + dx, c.y + dy);
+    match icon {
+        Icon::Search => {
+            painter.circle_stroke(p(-1.0, -1.0), 4.75, stroke);
+            painter.line_segment([p(2.5, 2.5), p(6.5, 6.5)], stroke);
+        }
+        Icon::List => {
+            for dy in [-4.5, 0.0, 4.5] {
+                painter.line_segment([p(-7.0, dy), p(7.0, dy)], stroke);
+            }
+        }
+        Icon::Key => {
+            // Ring, Schaft, zwei Zähne und ein kleiner Funke oben rechts.
+            painter.circle_stroke(p(-3.5, -0.5), 3.5, stroke);
+            painter.line_segment([p(0.0, -0.5), p(7.0, -0.5)], stroke);
+            painter.line_segment([p(4.75, -0.5), p(4.75, 2.5)], stroke);
+            painter.line_segment([p(2.25, -0.5), p(2.25, 1.5)], stroke);
+            let thin = Stroke::new(1.0, color);
+            painter.line_segment([p(8.0, -9.0), p(8.0, -5.0)], thin);
+            painter.line_segment([p(6.0, -7.0), p(10.0, -7.0)], thin);
+        }
+        Icon::Sliders => {
+            for (dy, knob) in [(-5.5, -1.0), (0.0, 4.0), (5.5, 1.0)] {
+                painter.line_segment([p(-7.0, dy), p(7.0, dy)], stroke);
+                painter.circle_filled(p(knob, dy), 3.0, color);
+            }
+        }
+        Icon::Lock => {
+            let body = Rect::from_center_size(p(0.0, 2.5), egui::vec2(11.0, 9.0));
+            let shackle = Rect::from_min_size(egui::pos2(body.left() + 1.5, body.top() - 6.0), egui::vec2(8.0, 8.0));
+            let rounding = Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 };
+            painter.rect_stroke(shackle, rounding, stroke);
+            painter.rect_filled(body, 2.0, color);
+        }
+    }
+}
+
+/// Passwortfeld wie im Entwurf: 44 px hoch, Punkte in Monospace.
+fn password_input(text: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text)
+        .password(true)
+        .font(FontId::monospace(16.0))
+        .margin(Margin::symmetric(14.0, 12.0))
+        .desired_width(f32::INFINITY)
+}
+
+/// Schalter im Stil des Entwurfs: 36 × 20, Akzentgrün, wenn aktiv.
+fn toggle(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(36.0, 20.0), Sense::click());
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    let painter = ui.painter();
+    let (fill, knob, knob_x) = if *value {
+        (theme::ACCENT, theme::ACCENT_TEXT, rect.right() - 10.0)
+    } else {
+        (theme::BORDER, theme::MUTED, rect.left() + 10.0)
+    };
+    painter.rect_filled(rect, 10.0, fill);
+    painter.circle_filled(egui::pos2(knob_x, rect.center().y), 8.0, knob);
+    response
+}
+
+/// Zeile mit Text links (15 px, optional Hinweis 13 px) und Schalter rechts.
+fn toggle_row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, value: &mut bool, height: f32) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.set_min_height(height);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let extra = if hint.is_some() { 21.0 } else { 0.0 };
+            ui.add_space((height - 20.0 - extra) / 2.0);
+            ui.label(RichText::new(label).size(15.0));
+            if let Some(hint) = hint {
+                ui.label(theme::muted(hint, 13.0));
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            changed = toggle(ui, value).changed();
+        });
+    });
+    changed
+}
+
+/// Längen-Regler wie im Entwurf: „Länge“ darüber, grüne Spur, Zahl als Griff, 12 und 32 an den Enden.
+fn length_slider(ui: &mut egui::Ui, value: &mut usize, min: usize, max: usize) -> bool {
+    ui.horizontal(|ui| {
+        ui.set_min_height(40.0);
+        ui.label(RichText::new("Länge").size(15.0));
+    });
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), Sense::click_and_drag());
+    let y = rect.top() + 18.0;
+    let track = Rect::from_min_max(egui::pos2(rect.left() + 28.0, y - 2.0), egui::pos2(rect.right() - 28.0, y + 2.0));
+
+    let mut changed = false;
+    if response.clicked() || response.dragged() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            let new = min + (t * (max - min) as f32).round() as usize;
+            if new != *value {
+                *value = new;
+                changed = true;
+            }
+        }
+    }
+
+    let t = (*value - min) as f32 / (max - min) as f32;
+    let x = track.left() + t * track.width();
+    let painter = ui.painter();
+    painter.rect_filled(track, 2.0, theme::BORDER);
+    painter.rect_filled(Rect::from_min_max(track.left_top(), egui::pos2(x, track.bottom())), 2.0, theme::ACCENT);
+    let mono = FontId::monospace(12.0);
+    painter.text(egui::pos2(rect.left(), y), Align2::LEFT_CENTER, min.to_string(), mono.clone(), theme::MUTED);
+    painter.text(egui::pos2(rect.right(), y), Align2::RIGHT_CENTER, max.to_string(), mono, theme::MUTED);
+    let badge = Rect::from_center_size(egui::pos2(x, y), egui::vec2(32.0, 20.0));
+    painter.rect_filled(badge, 6.0, theme::TEXT);
+    painter.text(
+        badge.center(),
+        Align2::CENTER_CENTER,
+        (*value).to_string(),
+        FontId::new(12.0, theme::mono_medium()),
+        theme::ACCENT_TEXT,
+    );
+    changed
+}
+
+fn avatar(ui: &mut egui::Ui, title: &str) {
+    let letter = title
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    // Fest 36 × 36 gezeichnet, damit die Zeile nicht die ganze Breite einnimmt.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), Sense::hover());
+    ui.painter().rect_filled(rect, 8.0, theme::PANEL);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, letter, FontId::new(17.0, theme::serif()), theme::TEXT);
+}
+
+/// Vier Balken für die Passwortstärke, ohne Beschriftung (wie im Entwurf).
+fn strength_bars(ui: &mut egui::Ui, pw: &str, bar_width: f32) {
+    let level = generator::strength(pw);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for i in 0..4 {
+            let color = if i < level { theme::ACCENT } else { theme::BORDER };
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_width, 4.0), Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, color);
+        }
+    });
 }

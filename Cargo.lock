@@ -130,6 +130,7 @@ version = "0.1.0"
 dependencies = [
  "aegis-core",
  "eframe",
+ "getrandom 0.2.17",
  "zeroize",
 ]
 

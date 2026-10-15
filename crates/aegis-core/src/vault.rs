@@ -15,12 +15,12 @@ const MAGIC: &[u8; 4] = b"AEGS";
 const FORMAT_VERSION: u8 = 1;
 const HEADER_LEN: usize = 4 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN; // 57
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Vault {
     pub entries: Vec<Entry>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub title: String,
     pub username: String,
