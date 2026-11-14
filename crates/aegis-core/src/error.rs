@@ -22,4 +22,13 @@ pub enum AegisError {
 
     #[error("Nicht unterstützte Format-Version: {0}")]
     UnsupportedVersion(u8),
+
+    #[error("Unsichere oder ungültige Parameter in der Tresordatei")]
+    UnsafeParams,
+
+    #[error("Es gibt bereits einen Tresor")]
+    AlreadyExists,
+
+    #[error("Aktuelles Passwort ist falsch")]
+    WrongPassword,
 }
