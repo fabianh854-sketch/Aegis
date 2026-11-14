@@ -38,9 +38,18 @@ fn write_temp(path: &Path, data: &[u8]) -> Result<PathBuf, AegisError> {
 /// Schreibt atomar: neue Temp-Datei, alte Datei als `.bak` sichern, dann Temp-Datei umbenennen.
 /// Bei einem Absturz bleibt entweder die alte oder die neue Datei. Jeder Fehler bricht ab.
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<(), AegisError> {
+    write_with(path, data, true)
+}
+
+/// Wie `write_atomic`, aber ohne Backup der bisherigen Datei.
+pub(crate) fn replace(path: &Path, data: &[u8]) -> Result<(), AegisError> {
+    write_with(path, data, false)
+}
+
+fn write_with(path: &Path, data: &[u8], backup: bool) -> Result<(), AegisError> {
     let tmp = write_temp(path, data)?;
     let result = (|| -> io::Result<()> {
-        if path.exists() {
+        if backup && path.exists() {
             fs::copy(path, backup_path(path))?;
         }
         fs::rename(&tmp, path) // unter Windows wird die Zieldatei ersetzt
