@@ -1,13 +1,16 @@
-use std::{fs, mem, path::PathBuf, time::{Duration, Instant}};
+use std::{fs, path::PathBuf, time::{Duration, Instant}};
 
-use aegis_core::{Entry, Vault};
+use aegis_core::{AegisError, Entry, KdfParams, Session, Vault};
 use eframe::egui::{
     self, Align, Align2, FontId, Layout, Margin, Pos2, Rect, RichText, Rounding, Sense, Stroke,
     UiBuilder, ViewportCommand,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::{generator, theme};
+use crate::{
+    clipboard::{ClipboardGuard, SystemClipboard},
+    generator, theme,
+};
 
 const AUTO_LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
 const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
@@ -15,6 +18,8 @@ const STATUS_VISIBLE_FOR: Duration = Duration::from_secs(4);
 const TITLE_BAR_HEIGHT: f32 = 40.0;
 const SIDEBAR_OPEN_WIDTH: f32 = 220.0;
 const SIDEBAR_CLOSED_WIDTH: f32 = 56.0;
+/// Mindestlänge für neue oder geänderte Master-Passwörter (in Zeichen, nicht Bytes).
+const MIN_MASTER_LEN: usize = 12;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Nav {
@@ -27,8 +32,11 @@ enum Nav {
 struct Editor {
     index: Option<usize>,
     entry: Entry,
+    /// Stand beim Öffnen, um ungespeicherte Änderungen zu erkennen.
+    original: Entry,
     reveal: bool,
     confirm_delete: bool,
+    confirm_cancel: bool,
 }
 
 struct Settings {
@@ -37,15 +45,15 @@ struct Settings {
 }
 
 pub struct AegisApp {
-    path: PathBuf,
+    /// Pfad zum Tresor oder Fehlertext, wenn er nicht bestimmt werden kann.
+    path: Result<PathBuf, String>,
     // Entsperren
-    password: String,
-    confirm: String,
+    password: Zeroizing<String>,
+    confirm: Zeroizing<String>,
     /// Formular „Neu anlegen“ ist offen. Nur möglich, solange keine Tresor-Datei existiert.
     creating: bool,
     // Sitzung
-    master: Option<Zeroizing<String>>,
-    vault: Option<Vault>,
+    session: Option<Session>,
     nav: Nav,
     sidebar_open: bool,
     search: String,
@@ -55,31 +63,33 @@ pub struct AegisApp {
     status_error: bool,
     status_at: Instant,
     last_activity: Instant,
-    clipboard_clear_at: Option<Instant>,
+    clipboard: ClipboardGuard<SystemClipboard>,
     // Passwortgenerator
     gen_opts: generator::Options,
-    gen_password: String,
+    gen_password: Zeroizing<String>,
     // Einstellungen
     settings: Settings,
     show_master_form: bool,
-    new_master: String,
-    new_master_confirm: String,
+    current_master: Zeroizing<String>,
+    new_master: Zeroizing<String>,
+    new_master_confirm: Zeroizing<String>,
 }
 
 impl Default for AegisApp {
     fn default() -> Self {
-        let base = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
+        // Kein Rückfall auf das aktuelle Verzeichnis: der Tresor soll nie an einem zufälligen Ort landen.
+        let path = std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|base| PathBuf::from(base).join("Aegis").join("vault.aegis"))
+            .ok_or_else(|| "APPDATA nicht gesetzt – Speicherort unbekannt".to_string());
         let gen_opts = generator::Options::default();
-        let gen_password = generator::generate(&gen_opts).unwrap_or_default();
+        let gen_password = Zeroizing::new(generator::generate(&gen_opts).unwrap_or_default());
         Self {
-            path: base.join("Aegis").join("vault.aegis"),
-            password: String::new(),
-            confirm: String::new(),
+            path,
+            password: Zeroizing::default(),
+            confirm: Zeroizing::default(),
             creating: false,
-            master: None,
-            vault: None,
+            session: None,
             nav: Nav::Entries,
             sidebar_open: true,
             search: String::new(),
@@ -89,13 +99,14 @@ impl Default for AegisApp {
             status_error: false,
             status_at: Instant::now(),
             last_activity: Instant::now(),
-            clipboard_clear_at: None,
+            clipboard: ClipboardGuard::new(SystemClipboard),
             gen_opts,
             gen_password,
             settings: Settings { auto_lock: true, clear_clipboard: true },
             show_master_form: false,
-            new_master: String::new(),
-            new_master_confirm: String::new(),
+            current_master: Zeroizing::default(),
+            new_master: Zeroizing::default(),
+            new_master_confirm: Zeroizing::default(),
         }
     }
 }
@@ -112,7 +123,7 @@ impl eframe::App for AegisApp {
             self.last_activity = now;
         }
 
-        if self.vault.is_some() {
+        if self.session.is_some() {
             if self.settings.auto_lock && now.duration_since(self.last_activity) >= AUTO_LOCK_AFTER {
                 self.lock();
                 self.set_status("Automatisch gesperrt", false);
@@ -122,7 +133,7 @@ impl eframe::App for AegisApp {
         }
 
         // Hinweise wie „Gespeichert“ verschwinden nach ein paar Sekunden, Fehler bleiben stehen.
-        if !self.status.is_empty() && !self.status_error && self.vault.is_some() {
+        if !self.status.is_empty() && !self.status_error && self.session.is_some() {
             let shown = now.duration_since(self.status_at);
             if shown >= STATUS_VISIBLE_FOR {
                 self.status.clear();
@@ -131,13 +142,8 @@ impl eframe::App for AegisApp {
             }
         }
 
-        if let Some(at) = self.clipboard_clear_at {
-            if now >= at {
-                ctx.copy_text(String::new());
-                self.clipboard_clear_at = None;
-            } else {
-                ctx.request_repaint_after(at - now);
-            }
+        if let Some(next) = self.clipboard.tick(now) {
+            ctx.request_repaint_after(next);
         }
 
         // Ein Fenster ohne Windows-Rahmen: eigener Rand mit Radius 12 und eigene Titelleiste.
@@ -148,7 +154,7 @@ impl eframe::App for AegisApp {
         egui::CentralPanel::default().frame(window).show(ctx, |ui| {
             let app_rect = ui.max_rect();
             let title_rect = Rect::from_min_size(app_rect.min, egui::vec2(app_rect.width(), TITLE_BAR_HEIGHT));
-            let unlocked = self.vault.is_some();
+            let unlocked = self.session.is_some();
             let status = if unlocked { self.status.as_str() } else { "" };
             title_bar(ui, title_rect, status, self.status_error);
 
@@ -161,6 +167,13 @@ impl eframe::App for AegisApp {
             }
         });
     }
+
+    /// Beim Beenden kein Passwort in der Zwischenablage zurücklassen.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.settings.clear_clipboard {
+            self.clipboard.clear_now();
+        }
+    }
 }
 
 impl AegisApp {
@@ -171,14 +184,17 @@ impl AegisApp {
     }
 
     fn lock(&mut self) {
-        self.vault = None;
-        self.master = None;
+        if self.settings.clear_clipboard {
+            self.clipboard.clear_now();
+        }
+        self.session = None; // Schlüssel und Einträge werden beim Drop genullt
         self.editor = None;
-        self.password.clear();
-        self.confirm.clear();
+        self.password.zeroize();
+        self.confirm.zeroize();
         self.search.clear();
-        self.new_master.clear();
-        self.new_master_confirm.clear();
+        self.current_master.zeroize();
+        self.new_master.zeroize();
+        self.new_master_confirm.zeroize();
         self.show_master_form = false;
         self.status.clear();
         self.nav = Nav::Entries;
@@ -187,7 +203,7 @@ impl AegisApp {
     // ---- Entsperren (Entwurf 01) -------------------------------------------
 
     fn unlock_view(&mut self, ui: &mut egui::Ui) {
-        let exists = self.path.exists();
+        let exists = self.path.as_ref().is_ok_and(|p| p.exists());
         let creating = self.creating && !exists;
 
         // Spalte 320 px breit, senkrecht und waagerecht mittig.
@@ -197,7 +213,7 @@ impl AegisApp {
         ui.spacing_mut().item_spacing.y = 8.0;
 
         ui.vertical_centered(|ui| {
-            let title = if creating { "Tresor anlegen" } else { "Unlock Vault" };
+            let title = if creating { "Tresor anlegen" } else { "Tresor entsperren" };
             ui.label(theme::heading(title, 34.0));
         });
         ui.add_space(12.0);
@@ -246,7 +262,10 @@ impl AegisApp {
             self.status.clear();
         }
 
-        if !self.status.is_empty() {
+        if let Err(problem) = &self.path {
+            ui.add_space(4.0);
+            ui.label(RichText::new(problem).size(13.0).color(theme::DANGER));
+        } else if !self.status.is_empty() {
             ui.add_space(4.0);
             let color = if self.status_error { theme::DANGER } else { theme::MUTED };
             ui.label(RichText::new(&self.status).size(13.0).color(color));
@@ -254,39 +273,44 @@ impl AegisApp {
     }
 
     fn unlock(&mut self, creating: bool) {
+        let path = match &self.path {
+            Ok(p) => p.clone(),
+            Err(problem) => {
+                let problem = problem.clone();
+                self.set_status(problem, true);
+                return;
+            }
+        };
         if self.password.is_empty() {
             self.set_status("Bitte Master-Passwort eingeben", true);
             return;
         }
-        let exists = self.path.exists();
 
         let result = if creating {
-            if exists {
-                self.set_status("Es gibt bereits einen Tresor", true);
+            if let Err(msg) = validate_new_master(&self.password, &self.confirm) {
+                self.set_status(msg, true);
                 return;
             }
-            if self.password != self.confirm {
-                self.set_status("Die Passwörter stimmen nicht überein", true);
-                return;
+            if let Some(dir) = path.parent() {
+                if let Err(e) = fs::create_dir_all(dir) {
+                    self.set_status(format!("Ordner konnte nicht angelegt werden: {e}"), true);
+                    return;
+                }
             }
-            if let Some(dir) = self.path.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            aegis_core::save(&self.path, self.password.as_bytes(), &Vault::default())
-                .map(|_| Vault::default())
+            Session::create(&path, self.password.as_bytes(), &KdfParams::default())
         } else {
-            if !exists {
+            if !path.exists() {
                 self.set_status("Noch kein Tresor vorhanden. Lege zuerst einen an.", true);
                 return;
             }
-            aegis_core::load(&self.path, self.password.as_bytes())
+            Session::open(&path, self.password.as_bytes())
         };
 
         match result {
-            Ok(vault) => {
-                self.vault = Some(vault);
-                self.master = Some(Zeroizing::new(mem::take(&mut self.password)));
-                self.confirm.clear();
+            Ok(session) => {
+                self.session = Some(session);
+                self.password.zeroize();
+                self.confirm.zeroize();
                 self.creating = false;
                 self.nav = Nav::Entries;
                 self.last_activity = Instant::now();
@@ -321,7 +345,7 @@ impl AegisApp {
         let mut main_ui = ui.new_child(
             UiBuilder::new().max_rect(main.shrink2(padding)).layout(Layout::top_down(Align::Min)),
         );
-        if self.vault.is_none() {
+        if self.session.is_none() {
             return;
         }
         if self.editor.is_some() {
@@ -395,7 +419,7 @@ impl AegisApp {
 
     fn entries_view(&mut self, ui: &mut egui::Ui) {
         let query = self.search.to_lowercase();
-        let rows: Vec<(usize, String, String)> = match &self.vault {
+        let rows: Vec<(usize, String, String)> = match self.session.as_ref().map(Session::vault) {
             Some(vault) => vault
                 .entries
                 .iter()
@@ -502,11 +526,18 @@ impl AegisApp {
     }
 
     fn open_editor(&mut self, index: Option<usize>) {
-        let entry = match (index, &self.vault) {
-            (Some(i), Some(vault)) => vault.entries[i].clone(),
+        let entry = match (index, &self.session) {
+            (Some(i), Some(session)) => session.vault().entries[i].clone(),
             _ => Entry::default(),
         };
-        self.editor = Some(Editor { index, entry, reveal: false, confirm_delete: false });
+        self.editor = Some(Editor {
+            index,
+            original: entry.clone(),
+            entry,
+            reveal: false,
+            confirm_delete: false,
+            confirm_cancel: false,
+        });
     }
 
     // ---- Eintrag (Entwurf 03) ----------------------------------------------
@@ -518,9 +549,11 @@ impl AegisApp {
             Some(e) if !e.entry.title.trim().is_empty() => e.entry.title.clone(),
             _ => "Neuer Eintrag".to_string(),
         };
+        let confirm_cancel = self.editor.as_ref().is_some_and(|e| e.confirm_cancel);
         let mut save = false;
         let mut cancel = false;
         let mut delete = false;
+        let mut copy = false;
 
         ui.horizontal(|ui| {
             ui.set_min_height(36.0);
@@ -530,7 +563,8 @@ impl AegisApp {
                 if ui.add(theme::accent_button("Speichern")).clicked() {
                     save = true;
                 }
-                if ui.add(theme::secondary_button("Abbrechen")).clicked() {
+                let label = if confirm_cancel { "Änderungen verwerfen?" } else { "Abbrechen" };
+                if ui.add(theme::secondary_button(label)).clicked() {
                     cancel = true;
                 }
             });
@@ -563,10 +597,7 @@ impl AegisApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(14.0);
                 if ui.add(theme::link_button("Kopieren", theme::ACCENT, 13.0)).clicked() {
-                    ui.ctx().copy_text(editor.entry.password.clone());
-                    if self.settings.clear_clipboard {
-                        self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
-                    }
+                    copy = true;
                 }
             });
         });
@@ -624,9 +655,20 @@ impl AegisApp {
             }
         }
 
+        // Abbrechen mit ungespeicherten Änderungen braucht einen zweiten Klick.
         if cancel {
-            self.editor = None;
-            self.status.clear();
+            if editor.entry != editor.original && !editor.confirm_cancel {
+                editor.confirm_cancel = true;
+            } else {
+                self.editor = None;
+                self.status.clear();
+            }
+        }
+        if copy {
+            if let Some(editor) = self.editor.as_ref() {
+                let secret = Zeroizing::new(editor.entry.password.clone());
+                self.copy_secret(ui.ctx(), &secret);
+            }
         }
         if save {
             self.save_editor();
@@ -643,8 +685,8 @@ impl AegisApp {
             self.set_status("Bitte einen Titel eingeben", true);
             return;
         }
-        let Some(current) = self.vault.as_ref() else { return };
-        let mut candidate = current.clone();
+        let Some(session) = self.session.as_ref() else { return };
+        let mut candidate = session.vault().clone();
         let entry = editor.entry.clone();
         match editor.index {
             Some(i) => candidate.entries[i] = entry,
@@ -658,8 +700,8 @@ impl AegisApp {
 
     fn delete_editor_entry(&mut self) {
         let Some(index) = self.editor.as_ref().and_then(|e| e.index) else { return };
-        let Some(current) = self.vault.as_ref() else { return };
-        let mut candidate = current.clone();
+        let Some(session) = self.session.as_ref() else { return };
+        let mut candidate = session.vault().clone();
         candidate.entries.remove(index);
         if self.commit(candidate) {
             self.editor = None;
@@ -669,12 +711,9 @@ impl AegisApp {
 
     /// Speichert `candidate` auf die Platte und macht es nur bei Erfolg zum aktuellen Vault.
     fn commit(&mut self, candidate: Vault) -> bool {
-        let Some(master) = self.master.as_ref() else { return false };
-        match aegis_core::save(&self.path, master.as_bytes(), &candidate) {
-            Ok(()) => {
-                self.vault = Some(candidate);
-                true
-            }
+        let Some(session) = self.session.as_mut() else { return false };
+        match session.commit(candidate) {
+            Ok(()) => true,
             Err(e) => {
                 self.set_status(format!("Speichern fehlgeschlagen: {e}"), true);
                 false
@@ -684,12 +723,26 @@ impl AegisApp {
 
     // ---- Passwortgenerator (Entwurf 04) ------------------------------------
 
+    /// Kopiert ein Geheimnis geschützt. Klappt das nicht, normal kopieren und darauf hinweisen.
+    fn copy_secret(&mut self, ctx: &egui::Context, secret: &str) {
+        if secret.is_empty() {
+            return;
+        }
+        let clear_after = self.settings.clear_clipboard.then_some(CLIPBOARD_CLEAR_AFTER);
+        if self.clipboard.copy(secret, clear_after, Instant::now()).is_err() {
+            ctx.copy_text(secret.to_string());
+            self.set_status("Kopiert – Verlauf konnte nicht ausgeschlossen werden", false);
+        }
+        ctx.request_repaint();
+    }
+
     fn regenerate(&mut self) {
-        self.gen_password = generator::generate(&self.gen_opts).unwrap_or_default();
+        self.gen_password = Zeroizing::new(generator::generate(&self.gen_opts).unwrap_or_default());
     }
 
     fn generator_view(&mut self, ui: &mut egui::Ui) {
         let mut regenerate = false;
+        let mut copy = false;
         ui.label(theme::heading("Passwortgenerator", 28.0));
         ui.add_space(4.0);
 
@@ -699,7 +752,7 @@ impl AegisApp {
             let shown = if self.gen_password.is_empty() {
                 "Mindestens eine Zeichengruppe wählen".to_string()
             } else {
-                self.gen_password.clone()
+                self.gen_password.to_string()
             };
             ui.label(RichText::new(shown).size(22.0).family(theme::mono_medium()));
             ui.horizontal(|ui| {
@@ -710,11 +763,8 @@ impl AegisApp {
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    if ui.add(theme::accent_button("Kopieren")).clicked() && !self.gen_password.is_empty() {
-                        ui.ctx().copy_text(self.gen_password.clone());
-                        if self.settings.clear_clipboard {
-                            self.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
-                        }
+                    if ui.add(theme::accent_button("Kopieren")).clicked() {
+                        copy = true;
                     }
                     if ui.add(theme::secondary_button("Neu erzeugen")).clicked() {
                         regenerate = true;
@@ -738,6 +788,10 @@ impl AegisApp {
             40.0,
         );
 
+        if copy {
+            let secret = self.gen_password.clone();
+            self.copy_secret(ui.ctx(), &secret);
+        }
         if regenerate {
             self.regenerate();
         }
@@ -780,7 +834,14 @@ impl AegisApp {
             if self.show_master_form {
                 theme::card().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.add(password_input(&mut self.new_master).hint_text(theme::muted("Neues Master-Passwort", 15.0)));
+                    ui.add(
+                        password_input(&mut self.current_master)
+                            .hint_text(theme::muted("Aktuelles Master-Passwort", 15.0)),
+                    );
+                    ui.add(
+                        password_input(&mut self.new_master)
+                            .hint_text(theme::muted("Neues Master-Passwort (mind. 12 Zeichen)", 15.0)),
+                    );
                     ui.add(password_input(&mut self.new_master_confirm).hint_text(theme::muted("Wiederholen", 15.0)));
                     if ui.add(theme::accent_button("Speichern")).clicked() {
                         change_master = true;
@@ -792,7 +853,12 @@ impl AegisApp {
                 ui.set_min_height(52.0);
                 ui.label(RichText::new("Speicherort").size(15.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(theme::muted("%APPDATA%\\Aegis\\vault.aegis", 13.0).monospace());
+                    let shown = match &self.path {
+                        Ok(p) => p.display().to_string(),
+                        Err(problem) => problem.clone(),
+                    };
+                    ui.add(egui::Label::new(theme::muted(shown.clone(), 13.0).monospace()).truncate())
+                        .on_hover_text(shown);
                 });
             });
             ui.add_space(16.0);
@@ -812,25 +878,46 @@ impl AegisApp {
     }
 
     fn change_master(&mut self) {
-        if self.new_master.is_empty() {
-            self.set_status("Bitte ein neues Passwort eingeben", true);
+        if self.current_master.is_empty() {
+            self.set_status("Bitte das aktuelle Passwort eingeben", true);
             return;
         }
-        if self.new_master != self.new_master_confirm {
-            self.set_status("Die Passwörter stimmen nicht überein", true);
+        if let Err(msg) = validate_new_master(&self.new_master, &self.new_master_confirm) {
+            self.set_status(msg, true);
             return;
         }
-        let Some(vault) = self.vault.as_ref() else { return };
-        match aegis_core::save(&self.path, self.new_master.as_bytes(), vault) {
+        let Some(session) = self.session.as_mut() else { return };
+        let result = session.change_master(
+            self.current_master.as_bytes(),
+            self.new_master.as_bytes(),
+            &KdfParams::default(),
+        );
+        self.current_master.zeroize();
+        match result {
             Ok(()) => {
-                self.master = Some(Zeroizing::new(mem::take(&mut self.new_master)));
-                self.new_master_confirm.clear();
+                self.new_master.zeroize();
+                self.new_master_confirm.zeroize();
                 self.show_master_form = false;
                 self.set_status("Master-Passwort geändert", false);
             }
+            Err(AegisError::WrongPassword) => self.set_status(AegisError::WrongPassword.to_string(), true),
             Err(e) => self.set_status(format!("Speichern fehlgeschlagen: {e}"), true),
         }
     }
+}
+
+/// Prüft ein neues Master-Passwort und seine Wiederholung.
+fn validate_new_master(new: &str, confirm: &str) -> Result<(), &'static str> {
+    if new.is_empty() {
+        return Err("Bitte ein neues Passwort eingeben");
+    }
+    if new.chars().count() < MIN_MASTER_LEN {
+        return Err("Mindestens 12 Zeichen");
+    }
+    if new != confirm {
+        return Err("Die Passwörter stimmen nicht überein");
+    }
+    Ok(())
 }
 
 // ---- Fenster-Titelleiste ---------------------------------------------------
@@ -1087,4 +1174,18 @@ fn strength_bars(ui: &mut egui::Ui, pw: &str, bar_width: f32) {
             ui.painter().rect_filled(rect, 2.0, color);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn master_policy() {
+        assert!(validate_new_master("", "").is_err());
+        assert!(validate_new_master("kurz", "kurz").is_err());
+        assert!(validate_new_master("zwölfzeichen", "zwölfzeichen").is_ok()); // 12 Zeichen
+        assert!(validate_new_master("äöüäöüäöüäö", "äöüäöüäöüäö").is_err()); // 11 Zeichen, 22 Byte
+        assert!(validate_new_master("zwölfzeichen", "zwölfzeichEn").is_err());
+    }
 }

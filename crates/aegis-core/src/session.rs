@@ -165,6 +165,19 @@ mod tests {
     }
 
     #[test]
+    fn tampered_file_fails() {
+        let path = temp_dir("s_tamper").join("vault.aegis");
+        let mut s = Session::create(&path, b"master", &fast()).unwrap();
+        s.commit(with_entry("A")).unwrap();
+        drop(s);
+        let mut data = fs::read(&path).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 0x01;
+        fs::write(&path, &data).unwrap();
+        assert!(matches!(Session::open(&path, b"master"), Err(AegisError::Crypto)));
+    }
+
+    #[test]
     fn commit_keeps_salt_changes_nonce() {
         let path = temp_dir("s_nonce").join("vault.aegis");
         let mut s = Session::create(&path, b"master", &fast()).unwrap();

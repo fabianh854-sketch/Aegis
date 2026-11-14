@@ -1,12 +1,9 @@
-use std::{fs, path::Path};
-
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{
-    crypto::{self, KdfParams, NONCE_LEN, SALT_LEN},
+    crypto::{KdfParams, NONCE_LEN, SALT_LEN},
     error::AegisError,
-    storage,
 };
 
 /// Dateiformat: MAGIC(4) | VERSION(1) | m(4) | t(4) | p(4) | SALT(16) | NONCE(24) | CIPHERTEXT
@@ -80,61 +77,12 @@ impl Header {
     }
 }
 
-pub fn save(path: &Path, master: &[u8], vault: &Vault) -> Result<(), AegisError> {
-    save_with_params(path, master, vault, &KdfParams::default())
-}
-
-pub fn save_with_params(
-    path: &Path,
-    master: &[u8],
-    vault: &Vault,
-    params: &KdfParams,
-) -> Result<(), AegisError> {
-    let header = Header {
-        params: params.clone(),
-        salt: crypto::random_bytes::<SALT_LEN>()?,
-        nonce: crypto::random_bytes::<NONCE_LEN>()?,
-    };
-    let encoded = header.encode();
-    let key = crypto::derive_key(master, &header.salt, params)?;
-    let plaintext = Zeroizing::new(serde_json::to_vec(vault)?);
-    let ciphertext = crypto::seal(&key, &header.nonce, &encoded, &plaintext)?;
-
-    let mut file = encoded.to_vec();
-    file.extend_from_slice(&ciphertext);
-    storage::write_atomic(path, &file)
-}
-
-pub fn load(path: &Path, master: &[u8]) -> Result<Vault, AegisError> {
-    let data = fs::read(path)?;
-    let header = Header::parse(&data)?;
-    let key = crypto::derive_key(master, &header.salt, &header.params)?;
-    let plaintext = Zeroizing::new(crypto::open(&key, &header.nonce, &data[..HEADER_LEN], &data[HEADER_LEN..])?);
-    Ok(serde_json::from_slice(&plaintext)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn fast() -> KdfParams {
         KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 }
-    }
-
-    fn temp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("aegis_test_{name}.aegis"))
-    }
-
-    fn sample() -> Vault {
-        Vault {
-            entries: vec![Entry {
-                title: "GitHub".into(),
-                username: "fabian".into(),
-                password: "geheim".into(),
-                notes: String::new(),
-            }],
-        }
     }
 
     fn header_with(m: u32, t: u32, p: u32) -> [u8; HEADER_LEN] {
@@ -177,33 +125,5 @@ mod tests {
     fn short_or_foreign_file_is_format_error() {
         assert!(matches!(Header::parse(b"AEG"), Err(AegisError::Format)));
         assert!(matches!(Header::parse(&[0u8; 80]), Err(AegisError::Format)));
-    }
-
-    #[test]
-    fn roundtrip() {
-        let path = temp("roundtrip");
-        save_with_params(&path, b"master", &sample(), &fast()).unwrap();
-        let loaded = load(&path, b"master").unwrap();
-        assert_eq!(loaded.entries[0].title, "GitHub");
-    }
-
-    #[test]
-    fn wrong_password_fails() {
-        let path = temp("wrong_pw");
-        save_with_params(&path, b"master", &sample(), &fast()).unwrap();
-        assert!(load(&path, b"falsch").is_err());
-    }
-
-    #[test]
-    fn tampered_file_fails() {
-        let path = temp("tampered");
-        save_with_params(&path, b"master", &sample(), &fast()).unwrap();
-
-        let mut data = fs::read(&path).unwrap();
-        let last = data.len() - 1;
-        data[last] ^= 0x01;
-        fs::write(&path, &data).unwrap();
-
-        assert!(load(&path, b"master").is_err());
     }
 }
