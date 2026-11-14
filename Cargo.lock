@@ -129,6 +129,7 @@ name = "aegis-app"
 version = "0.0.8"
 dependencies = [
  "aegis-core",
+ "arboard",
  "eframe",
  "getrandom 0.2.17",
  "zeroize",
