@@ -25,3 +25,5 @@ cargo build --release --offline
 ## Datenspeicherung
 
 Der Vault liegt unter `%APPDATA%\Aegis\vault.aegis`.
+Vor jedem Speichern wird die bisherige Datei als `vault.aegis.bak` gesichert.
+Nach einem Wechsel des Master-Passworts wird auch das Backup ersetzt, damit keine Kopie mit dem alten Passwort bleibt.
