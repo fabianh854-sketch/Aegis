@@ -67,7 +67,14 @@ impl Session {
 
     /// Wechselt das Master-Passwort. `current` muss zum gehaltenen Schlüssel passen.
     /// Danach wird auch das Backup ersetzt, damit keine Kopie mit dem alten Passwort bleibt.
-    pub fn change_master(&mut self, current: &[u8], new: &[u8], params: &KdfParams) -> Result<(), AegisError> {
+    /// Ist die Tresordatei geschrieben, gilt der Wechsel als erfolgt; ein Problem mit dem Backup
+    /// wird als `MasterChange::BackupNotRemoved` gemeldet, nicht als Fehler.
+    pub fn change_master(
+        &mut self,
+        current: &[u8],
+        new: &[u8],
+        params: &KdfParams,
+    ) -> Result<MasterChange, AegisError> {
         let check = crypto::derive_key(current, &self.header.salt, &self.header.params)?;
         if !constant_time_eq(&check[..], &self.key[..]) {
             return Err(AegisError::WrongPassword);
@@ -79,21 +86,32 @@ impl Session {
         };
         let key = crypto::derive_key(new, &header.salt, &header.params)?;
         let data = encrypt(&key, &header, &self.vault)?;
-        storage::write_atomic(&self.path, &data)?;
+        // Ohne Backup-Kopie schreiben: die bisherige Datei hat das alte Passwort und soll nicht
+        // als neues `.bak` liegen bleiben.
+        storage::replace(&self.path, &data)?;
         self.header = header;
         self.key = key;
         // Altes Backup durch das neue ersetzen; klappt das nicht, lieber gar kein Backup als eins
-        // mit dem alten Passwort. Erst wenn auch Löschen scheitert, geht ein Fehler an die UI.
+        // mit dem alten Passwort.
         let backup = storage::backup_path(&self.path);
         if storage::replace(&backup, &data).is_err() {
             match fs::remove_file(&backup) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                Err(_) => return Ok(MasterChange::BackupNotRemoved(backup)),
             }
         }
-        Ok(())
+        Ok(MasterChange::Complete)
     }
+}
+
+/// Ergebnis eines erfolgreichen Passwortwechsels.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MasterChange {
+    Complete,
+    /// Neues Passwort gilt, aber unter diesem Pfad liegt noch ein Backup mit dem alten Passwort.
+    BackupNotRemoved(PathBuf),
 }
 
 fn encrypt(key: &[u8; KEY_LEN], header: &Header, vault: &Vault) -> Result<Vec<u8>, AegisError> {
@@ -215,7 +233,7 @@ mod tests {
         let path = temp_dir("s_cm").join("vault.aegis");
         let mut s = Session::create(&path, b"master", &fast()).unwrap();
         s.commit(with_entry("A")).unwrap();
-        s.change_master(b"master", b"neues-passwort", &fast()).unwrap();
+        assert_eq!(s.change_master(b"master", b"neues-passwort", &fast()).unwrap(), MasterChange::Complete);
         // Weiter speichern funktioniert mit dem neuen Schlüssel.
         s.commit(with_entry("B")).unwrap();
         drop(s);
@@ -227,13 +245,25 @@ mod tests {
     }
 
     #[test]
+    fn change_master_succeeds_when_backup_cannot_be_removed() {
+        let path = temp_dir("s_cm_locked_bak").join("vault.aegis");
+        let mut s = Session::create(&path, b"master", &fast()).unwrap();
+        // Ein Verzeichnis an Stelle des Backups lässt sich weder ersetzen noch per remove_file löschen.
+        fs::create_dir(backup_path(&path)).unwrap();
+        let outcome = s.change_master(b"master", b"neues-passwort", &fast()).unwrap();
+        assert_eq!(outcome, MasterChange::BackupNotRemoved(backup_path(&path)));
+        drop(s);
+        assert!(Session::open(&path, b"neues-passwort").is_ok());
+    }
+
+    #[test]
     fn change_master_leaves_no_copy_with_old_password() {
         let dir = temp_dir("s_cm_copies");
         let path = dir.join("vault.aegis");
         let mut s = Session::create(&path, b"master", &fast()).unwrap();
         s.commit(with_entry("A")).unwrap();
         s.commit(with_entry("B")).unwrap();
-        s.change_master(b"master", b"neues-passwort", &fast()).unwrap();
+        assert_eq!(s.change_master(b"master", b"neues-passwort", &fast()).unwrap(), MasterChange::Complete);
         drop(s);
         for e in fs::read_dir(&dir).unwrap() {
             let p = e.unwrap().path();

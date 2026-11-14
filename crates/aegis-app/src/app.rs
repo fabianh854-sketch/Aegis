@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, time::{Duration, Instant}};
 
-use aegis_core::{AegisError, Entry, KdfParams, Session, Vault};
+use aegis_core::{AegisError, Entry, KdfParams, MasterChange, Session, Vault};
 use eframe::egui::{
     self, Align, Align2, FontId, Layout, Margin, Pos2, Rect, RichText, Rounding, Sense, Stroke,
     UiBuilder, ViewportCommand,
@@ -894,11 +894,21 @@ impl AegisApp {
         );
         self.current_master.zeroize();
         match result {
-            Ok(()) => {
+            Ok(outcome) => {
                 self.new_master.zeroize();
                 self.new_master_confirm.zeroize();
                 self.show_master_form = false;
-                self.set_status("Master-Passwort geändert", false);
+                match outcome {
+                    MasterChange::Complete => self.set_status("Master-Passwort geändert", false),
+                    // Rot, damit der Hinweis stehen bleibt: das neue Passwort gilt trotzdem.
+                    MasterChange::BackupNotRemoved(path) => self.set_status(
+                        format!(
+                            "Master-Passwort geändert, aber altes Backup {} konnte nicht entfernt werden – bitte manuell löschen",
+                            path.display()
+                        ),
+                        true,
+                    ),
+                }
             }
             Err(AegisError::WrongPassword) => self.set_status(AegisError::WrongPassword.to_string(), true),
             Err(e) => self.set_status(format!("Speichern fehlgeschlagen: {e}"), true),
