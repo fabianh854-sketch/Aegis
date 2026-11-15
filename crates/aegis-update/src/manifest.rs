@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 pub const VALIDITY_SECS: u64 = 7 * 24 * 3600;
 /// Toleranz für eine vorgehende Uhr: ein Tag.
 const MAX_CLOCK_SKEW_SECS: u64 = 86400;
+/// `Decision::Rejected::reason`, wenn das Manifest „noch nicht gültig“ ist:
+/// meist geht die Systemuhr weit nach. Die App zeigt dafür einen eigenen Hinweis.
+pub const REASON_CLOCK: &str = "Systemuhr";
 /// Einzige erlaubte Dateien im Manifest, je genau einmal.
 const ALLOWED_FILES: [&str; 2] = ["aegis.exe", "aegis-updater.exe"];
 
@@ -164,7 +167,11 @@ pub fn decide(
             Err(e) => e,
         };
         if tag > installed && rejected.as_ref().is_none_or(|(v, _)| tag > *v) {
-            rejected = Some((tag, invalid.to_string()));
+            let reason = match invalid {
+                UpdateError::NotYetValid => REASON_CLOCK.to_string(),
+                other => other.to_string(),
+            };
+            rejected = Some((tag, reason));
         }
     }
 
@@ -308,7 +315,17 @@ mod tests {
             verify(&json, &sig, &[], NOW),
             Err(UpdateError::NoTrustedKey)
         );
-        assert!(crate::TRUSTED_KEYS.is_empty());
+    }
+
+    #[test]
+    fn every_trusted_key_parses() {
+        // Fängt einen falsch eingefügten Schlüssel ab; mit leerer Liste trivial erfüllt.
+        for key in crate::TRUSTED_KEYS {
+            assert!(
+                PublicKey::from_base64(key).is_ok(),
+                "TRUSTED_KEYS enthält keinen gültigen Minisign-Public-Key: {key:?}"
+            );
+        }
     }
 
     #[test]
@@ -521,6 +538,28 @@ mod tests {
             decide(v("0.1.0"), cands, NOW),
             Decision::Rejected { version, .. } if version == v("0.4.0")
         ));
+    }
+
+    #[test]
+    fn decide_names_clock_when_not_yet_valid() {
+        // Systemuhr weit in der Vergangenheit: das neuere Manifest ist "noch nicht gültig".
+        let cands = vec![(v("0.2.0"), Err(UpdateError::NotYetValid))];
+        assert_eq!(
+            decide(v("0.1.0"), cands, NOW),
+            Decision::Rejected {
+                version: v("0.2.0"),
+                reason: REASON_CLOCK.to_string()
+            }
+        );
+        // Andere Gründe bleiben der Fehlertext.
+        let cands = vec![(v("0.2.0"), Err(UpdateError::BadSignature))];
+        assert_eq!(
+            decide(v("0.1.0"), cands, NOW),
+            Decision::Rejected {
+                version: v("0.2.0"),
+                reason: UpdateError::BadSignature.to_string()
+            }
+        );
     }
 
     #[test]

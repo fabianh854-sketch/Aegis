@@ -81,7 +81,7 @@ pub fn sign_bytes(
 
 /// Fehlermeldung bei leerer Schlüsselliste.
 pub const NO_KEY_MSG: &str =
-    "Kein vertrauenswürdiger Schlüssel in aegis-update/src/keys.rs eingetragen.";
+    "Kein vertrauenswürdiger Schlüssel in crates/aegis-update/src/keys.rs eingetragen.";
 
 /// Prüft Manifest und Signatur wie der Updater. Mit leerer Schlüsselliste schlägt sie fehl.
 pub fn self_check(json: &[u8], sig: &str, keys: &[&str], now: u64) -> Result<Manifest, String> {
@@ -217,7 +217,7 @@ mod tests {
     fn self_check_fails_closed_without_keys() {
         let err = self_check(b"{}", "x", &[], NOW).unwrap_err();
         assert!(err
-            .contains("Kein vertrauenswürdiger Schlüssel in aegis-update/src/keys.rs eingetragen"));
+            .contains("Kein vertrauenswürdiger Schlüssel in crates/aegis-update/src/keys.rs eingetragen"));
     }
 
     fn signed_previous(m: &Manifest) -> (Vec<u8>, String, String) {

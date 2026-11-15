@@ -60,12 +60,16 @@ struct UpdatePoll {
     started_at: u64,
     give_up_at: Instant,
     next_read: Instant,
+    /// „Jetzt nach Updates suchen“: auch „kein Update“ und Fehler melden (die Startprüfung bleibt still).
+    manual: bool,
 }
 
 /// Klick in der Hinweisleiste.
 enum BannerAction {
     Install,
     Later,
+    /// Installationsfehler gelesen und geschlossen.
+    DismissInstallFailure,
 }
 
 pub struct AegisApp {
@@ -107,6 +111,8 @@ pub struct AegisApp {
     update_status: Option<UpdateStatus>,
     /// „Später“ gilt nur für diese Sitzung der App.
     update_dismissed: bool,
+    /// Fehler der letzten Installation (beim Start einmal aus `update.json` gelesen), bis er geschlossen wird.
+    install_failure: Option<String>,
 }
 
 impl Default for AegisApp {
@@ -147,6 +153,7 @@ impl Default for AegisApp {
             update_poll: None,
             update_status: None,
             update_dismissed: false,
+            install_failure: None,
         }
     }
 }
@@ -159,15 +166,18 @@ impl AegisApp {
             app.persisted = settings::load(&path);
         }
         app.updater = updates::updater_path();
+        // Genau einmal und vor der Startprüfung lesen: Diese überschreibt update.json gleich.
+        let last = aegis_update::status_path().and_then(|path| aegis_update::read_status(&path));
+        app.install_failure = updates::install_failure(last.as_ref(), aegis_update::now());
         if app.persisted.check_updates_on_start {
             // Ein Fehler beim Start der Prüfung ist hier kein Grund zu stören; „Jetzt suchen“ zeigt ihn.
-            let _ = app.start_update_check();
+            let _ = app.start_update_check(false);
         }
         app
     }
 
     /// Startet `--check` und wartet danach auf ein frisches Ergebnis in `update.json`.
-    fn start_update_check(&mut self) -> std::io::Result<()> {
+    fn start_update_check(&mut self, manual: bool) -> std::io::Result<()> {
         let updater = self
             .updater
             .clone()
@@ -179,6 +189,7 @@ impl AegisApp {
             started_at,
             give_up_at: now + UPDATE_POLL_FOR,
             next_read: now + UPDATE_POLL_EVERY,
+            manual,
         });
         Ok(())
     }
@@ -192,13 +203,25 @@ impl AegisApp {
                 .and_then(|path| aegis_update::read_status(&path))
                 .filter(|status| updates::is_fresh(status, poll.started_at));
             if let Some(status) = fresh {
-                self.update_status = Some(status);
+                let manual = poll.manual;
                 self.update_poll = None;
+                if manual {
+                    match updates::check_notice(&status) {
+                        Some((text, error)) => self.set_status(text, error),
+                        // Ausdrücklich gesucht: ein früheres „Später“ gilt dann nicht mehr.
+                        None => self.update_dismissed = false,
+                    }
+                }
+                self.update_status = Some(status);
                 return;
             }
         }
         if now >= poll.give_up_at {
+            let manual = poll.manual;
             self.update_poll = None;
+            if manual {
+                self.set_status(updates::CHECK_TIMEOUT_NOTICE, true);
+            }
         } else {
             ctx.request_repaint_after(poll.next_read.saturating_duration_since(now));
         }
@@ -288,7 +311,11 @@ impl eframe::App for AegisApp {
             }
 
             // Hinweisleiste direkt unter der Titelleiste; der Inhalt rückt entsprechend nach unten.
-            let banner = updates::banner_for(self.update_status.as_ref(), self.update_dismissed);
+            let banner = updates::select_banner(
+                self.install_failure.as_deref(),
+                self.update_status.as_ref(),
+                self.update_dismissed,
+            );
             let mut content_top = title_rect.bottom();
             let mut banner_action = None;
             if banner != Banner::Hidden {
@@ -311,6 +338,7 @@ impl eframe::App for AegisApp {
             match banner_action {
                 Some(BannerAction::Install) => self.install_update(ctx),
                 Some(BannerAction::Later) => self.update_dismissed = true,
+                Some(BannerAction::DismissInstallFailure) => self.install_failure = None,
                 None => {}
             }
         });
@@ -971,7 +999,7 @@ impl AegisApp {
                         let busy = self.update_poll.is_some();
                         let button = theme::secondary_button("Jetzt nach Updates suchen").min_size(egui::vec2(0.0, 34.0));
                         if ui.add_enabled(!busy, button).clicked() {
-                            match self.start_update_check() {
+                            match self.start_update_check(true) {
                                 Ok(()) => self.set_status("Suche nach Updates…", false),
                                 Err(e) => self.set_status(format!("Updater konnte nicht gestartet werden: {e}"), true),
                             }
@@ -1205,11 +1233,10 @@ fn title_bar(
     toggled
 }
 
-/// Mini-Schild aus `assets/icon/aegis-mark-32.png` (erzeugt aus `aegis-mark.svg`).
 /// Hinweisleiste (36 px) unter der Titelleiste. Gibt zurück, welcher Knopf gedrückt wurde.
 fn banner_bar(ui: &mut egui::Ui, rect: Rect, banner: &Banner) -> Option<BannerAction> {
     let text = updates::banner_text(banner)?;
-    let danger = matches!(banner, Banner::Security { .. } | Banner::Rejected { .. });
+    let danger = matches!(banner, Banner::Security { .. } | Banner::Rejected { .. } | Banner::InstallFailed { .. });
     let (fill, color) = match banner {
         _ if danger => (theme::DANGER.gamma_multiply(0.14), theme::DANGER),
         Banner::Stale { .. } => (theme::SURFACE, theme::MUTED),
@@ -1239,12 +1266,18 @@ fn banner_bar(ui: &mut egui::Ui, rect: Rect, banner: &Banner) -> Option<BannerAc
                     action = Some(BannerAction::Later);
                 }
             }
+            Banner::InstallFailed { .. } => {
+                if ui.add(theme::secondary_button("Schließen").min_size(small)).clicked() {
+                    action = Some(BannerAction::DismissInstallFailure);
+                }
+            }
             Banner::Hidden | Banner::Stale { .. } | Banner::Rejected { .. } => {}
         }
     });
     action
 }
 
+/// Mini-Schild aus `assets/icon/aegis-mark-32.png` (erzeugt aus `aegis-mark.svg`).
 fn title_mark_image() -> egui::ColorImage {
     // Fest eingebettet: Ein Dekodierfehler wäre ein kaputter Build, kein Laufzeitfall.
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/aegis-mark-32.png"))

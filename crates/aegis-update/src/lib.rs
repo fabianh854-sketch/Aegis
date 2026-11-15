@@ -7,7 +7,8 @@ mod version;
 
 pub use keys::TRUSTED_KEYS;
 pub use manifest::{
-    decide, sha256_hex, verify, Decision, FileEntry, Manifest, UpdateError, VALIDITY_SECS,
+    decide, sha256_hex, verify, Decision, FileEntry, Manifest, UpdateError, REASON_CLOCK,
+    VALIDITY_SECS,
 };
 pub use status::{now, read_status, staging_dir, status_path, write_status, UpdateStatus};
 pub use version::{installed, Version};

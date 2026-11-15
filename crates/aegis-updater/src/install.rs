@@ -185,12 +185,27 @@ fn remove_all(paths: &[PathBuf]) {
     }
 }
 
+/// Fehlt `<name>`, aber `<name>.old` liegt noch da (abgebrochene Installation): zurückbenennen,
+/// damit Aegis wieder startet. Vorhandene Dateien werden nie überschrieben.
+pub fn restore_missing(target: &Path) {
+    for name in FILES {
+        let current = target.join(name);
+        let old = with_suffix(target, name, ".old");
+        if !current.exists() && old.is_file() {
+            // Bestes Bemühen; scheitert es, bleibt `.old` für den nächsten Versuch liegen.
+            let _ = fs::rename(&old, &current);
+        }
+    }
+}
+
 /// Löscht Reste früherer Updates (`*.old`, `*.new` der festen Dateinamen).
+/// `<name>.old` nur, wenn `<name>` als Datei da ist: sonst ist es die einzige Kopie.
 pub fn cleanup_old(target: &Path) {
     for name in FILES {
-        for suffix in [".old", ".new"] {
-            // Kann scheitern, solange die alte Datei noch läuft; dann beim nächsten Mal.
-            let _ = fs::remove_file(with_suffix(target, name, suffix));
+        // Kann scheitern, solange die alte Datei noch läuft; dann beim nächsten Mal.
+        let _ = fs::remove_file(with_suffix(target, name, ".new"));
+        if target.join(name).is_file() {
+            let _ = fs::remove_file(with_suffix(target, name, ".old"));
         }
     }
 }
@@ -338,7 +353,9 @@ mod tests {
     fn replace_rolls_back_when_target_locked() {
         use std::os::windows::fs::OpenOptionsExt;
         let (staging, target) = setup("locked");
-        // Offener Schreib-Handle ohne Freigaben: Umbenennen von aegis-updater.exe scheitert.
+        // Offener Schreib-Handle ohne Freigaben (z. B. Virenscanner): Umbenennen von aegis-updater.exe
+        // scheitert. Das bildet eine gesperrte Datei ab, keine laufende .exe: Eine laufende .exe lässt
+        // sich unter Windows umbenennen, eine zweite Aegis-Instanz verhindert das Ersetzen also nicht.
         let lock = fs::OpenOptions::new()
             .write(true)
             .share_mode(0)
@@ -360,6 +377,44 @@ mod tests {
         drop(_guard);
         assert!(matches!(result, Err(UpdateError::Io(_))), "{result:?}");
         assert_old_state(&target);
+    }
+
+    #[test]
+    fn cleanup_keeps_old_file_when_current_missing() {
+        let (_, target) = setup("cleanup-missing");
+        fs::remove_file(target.join("aegis.exe")).unwrap();
+        fs::write(target.join("aegis.exe.old"), OLD_APP).unwrap();
+        fs::write(target.join("aegis-updater.exe.old"), OLD_UPDATER).unwrap();
+        cleanup_old(&target);
+        assert_eq!(
+            fs::read(target.join("aegis.exe.old")).unwrap(),
+            OLD_APP,
+            "einzige Kopie von aegis.exe bleibt"
+        );
+        assert!(
+            !target.join("aegis-updater.exe.old").exists(),
+            "aegis-updater.exe ist da, die alte Kopie darf weg"
+        );
+    }
+
+    #[test]
+    fn restore_missing_renames_old_back() {
+        let (_, target) = setup("restore");
+        fs::remove_file(target.join("aegis.exe")).unwrap();
+        fs::write(target.join("aegis.exe.old"), OLD_APP).unwrap();
+        // aegis-updater.exe ist vorhanden: die .old-Datei wird nicht darübergelegt.
+        fs::write(target.join("aegis-updater.exe.old"), b"noch aelter").unwrap();
+        restore_missing(&target);
+        assert_eq!(fs::read(target.join("aegis.exe")).unwrap(), OLD_APP);
+        assert!(!target.join("aegis.exe.old").exists());
+        assert_eq!(
+            fs::read(target.join("aegis-updater.exe")).unwrap(),
+            OLD_UPDATER
+        );
+        assert!(target.join("aegis-updater.exe.old").exists());
+        // Nichts zu tun, fehlender Ordner: kein Fehler, keine Panik.
+        restore_missing(&target);
+        restore_missing(&target.join("fehlt"));
     }
 
     #[test]

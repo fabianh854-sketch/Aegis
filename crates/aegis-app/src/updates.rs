@@ -15,8 +15,48 @@ pub enum Banner {
     Update { version: String },
     Security { version: String },
     Stale { since: u64 },
-    Rejected { version: String },
+    /// `clock`: abgelehnt, weil das Manifest „noch nicht gültig“ ist (Systemuhr geht nach).
+    Rejected { version: String, clock: bool },
+    /// Fehler bei der letzten Installation (aus `update.json` beim Start).
+    InstallFailed { message: String },
 }
+
+/// So lange nach dem Fehler zeigt die App einen Installationsfehler beim Start noch an.
+pub const INSTALL_FAILURE_SHOWN_FOR_SECS: u64 = 10 * 60;
+
+/// Meldung eines Installationsfehlers, wenn er höchstens 10 Minuten alt ist.
+/// Liegt `checked_at` in der Zukunft (Uhr verstellt), wird er angezeigt: lieber einmal zu viel.
+pub fn install_failure(status: Option<&UpdateStatus>, now: u64) -> Option<String> {
+    match status {
+        Some(UpdateStatus::Error { checked_at, message, during_install: true })
+            if now.saturating_sub(*checked_at) <= INSTALL_FAILURE_SHOWN_FOR_SECS =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Ein noch nicht geschlossener Installationsfehler geht jedem anderen Hinweis vor.
+pub fn select_banner(install_failure: Option<&str>, status: Option<&UpdateStatus>, dismissed: bool) -> Banner {
+    match install_failure {
+        Some(message) => Banner::InstallFailed { message: message.to_string() },
+        None => banner_for(status, dismissed),
+    }
+}
+
+/// Rückmeldung für „Jetzt nach Updates suchen“: (Text, ist Fehler).
+/// `None`, wenn die Hinweisleiste das Ergebnis zeigt.
+pub fn check_notice(status: &UpdateStatus) -> Option<(String, bool)> {
+    match status {
+        UpdateStatus::None { .. } => Some(("Kein Update verfügbar".to_string(), false)),
+        UpdateStatus::Error { message, .. } => Some((format!("Update-Prüfung fehlgeschlagen: {message}"), true)),
+        UpdateStatus::Available { .. } | UpdateStatus::Stale { .. } | UpdateStatus::Rejected { .. } => None,
+    }
+}
+
+/// Rückmeldung, wenn eine manuelle Prüfung in der Wartezeit kein Ergebnis liefert.
+pub const CHECK_TIMEOUT_NOTICE: &str = "Update-Prüfung fehlgeschlagen: keine Antwort vom Updater";
 
 pub fn banner_for(status: Option<&UpdateStatus>, dismissed: bool) -> Banner {
     match status {
@@ -26,7 +66,10 @@ pub fn banner_for(status: Option<&UpdateStatus>, dismissed: bool) -> Banner {
         Some(UpdateStatus::Available { .. }) if dismissed => Banner::Hidden,
         Some(UpdateStatus::Available { version, .. }) => Banner::Update { version: version.to_string() },
         Some(UpdateStatus::Stale { expired_at, .. }) => Banner::Stale { since: *expired_at },
-        Some(UpdateStatus::Rejected { version, .. }) => Banner::Rejected { version: version.to_string() },
+        Some(UpdateStatus::Rejected { version, reason, .. }) => Banner::Rejected {
+            version: version.to_string(),
+            clock: reason == aegis_update::REASON_CLOCK,
+        },
         Some(UpdateStatus::None { .. } | UpdateStatus::Error { .. }) | None => Banner::Hidden,
     }
 }
@@ -38,9 +81,13 @@ pub fn banner_text(banner: &Banner) -> Option<String> {
         Banner::Security { version } => Some(format!("Sicherheitsupdate v{version} verfügbar")),
         Banner::Update { version } => Some(format!("Neue Version v{version} verfügbar")),
         Banner::Stale { since } => Some(format!("Update-Status nicht bestätigt – seit {}", format_date(*since))),
-        Banner::Rejected { version } => {
+        Banner::Rejected { version, clock: false } => {
             Some(format!("Update v{version} konnte nicht verifiziert werden – nicht installiert"))
         }
+        Banner::Rejected { version, clock: true } => {
+            Some(format!("Update v{version} konnte nicht verifiziert werden – Systemuhr prüfen"))
+        }
+        Banner::InstallFailed { message } => Some(format!("Update fehlgeschlagen: {message}")),
     }
 }
 
@@ -59,9 +106,11 @@ pub fn format_date(unix_secs: u64) -> String {
     format!("{day:02}.{month:02}.{year}")
 }
 
-/// Stammt der Status aus einer Prüfung, die nach dem App-Start lief?
+/// Stammt der Status aus einer Prüfung, die nach ihrem Start lief?
+/// Ein Installationsfehler ist nie das Ergebnis einer Prüfung.
 pub fn is_fresh(status: &UpdateStatus, started_at: u64) -> bool {
-    status.checked_at() >= started_at
+    let install_error = matches!(status, UpdateStatus::Error { during_install: true, .. });
+    !install_error && status.checked_at() >= started_at
 }
 
 /// `aegis-updater.exe` neben der laufenden `aegis.exe`, nur wenn die Datei existiert.
@@ -110,7 +159,7 @@ mod tests {
         assert_eq!(banner_for(None, false), Banner::Hidden);
         let none = UpdateStatus::None { checked_at: 1 };
         assert_eq!(banner_for(Some(&none), false), Banner::Hidden);
-        let err = UpdateStatus::Error { checked_at: 1, message: "offline".into() };
+        let err = UpdateStatus::Error { checked_at: 1, message: "offline".into(), during_install: false };
         assert_eq!(banner_for(Some(&err), false), Banner::Hidden);
         assert_eq!(banner_for(Some(&err), true), Banner::Hidden);
     }
@@ -138,7 +187,7 @@ mod tests {
     #[test]
     fn banner_rejected_ignores_dismiss() {
         let s = UpdateStatus::Rejected { checked_at: 5, version: v("0.1.1"), reason: "Signatur".into() };
-        let expected = Banner::Rejected { version: "0.1.1".into() };
+        let expected = Banner::Rejected { version: "0.1.1".into(), clock: false };
         assert_eq!(banner_for(Some(&s), false), expected);
         assert_eq!(banner_for(Some(&s), true), expected);
     }
@@ -168,9 +217,75 @@ mod tests {
             Some("Update-Status nicht bestätigt – seit 14.11.2023")
         );
         assert_eq!(
-            banner_text(&Banner::Rejected { version: "0.1.1".into() }).as_deref(),
+            banner_text(&Banner::Rejected { version: "0.1.1".into(), clock: false }).as_deref(),
             Some("Update v0.1.1 konnte nicht verifiziert werden – nicht installiert")
         );
+        assert_eq!(
+            banner_text(&Banner::Rejected { version: "0.1.1".into(), clock: true }).as_deref(),
+            Some("Update v0.1.1 konnte nicht verifiziert werden – Systemuhr prüfen")
+        );
+        assert_eq!(
+            banner_text(&Banner::InstallFailed { message: "Prüfsumme stimmt nicht: aegis.exe".into() }).as_deref(),
+            Some("Update fehlgeschlagen: Prüfsumme stimmt nicht: aegis.exe")
+        );
+    }
+
+    #[test]
+    fn banner_rejected_names_clock() {
+        let s = UpdateStatus::Rejected {
+            checked_at: 5,
+            version: v("0.1.1"),
+            reason: aegis_update::REASON_CLOCK.into(),
+        };
+        let expected = Banner::Rejected { version: "0.1.1".into(), clock: true };
+        assert_eq!(banner_for(Some(&s), false), expected);
+        assert_eq!(banner_for(Some(&s), true), expected);
+    }
+
+    fn install_error(checked_at: u64) -> UpdateStatus {
+        UpdateStatus::Error { checked_at, message: "Hash".into(), during_install: true }
+    }
+
+    #[test]
+    fn install_failure_only_for_recent_install_errors() {
+        let now = 10_000;
+        assert_eq!(install_failure(Some(&install_error(now)), now).as_deref(), Some("Hash"));
+        assert_eq!(install_failure(Some(&install_error(now - 600)), now).as_deref(), Some("Hash"));
+        assert_eq!(install_failure(Some(&install_error(now - 601)), now), None, "älter als 10 Minuten");
+        let check_error = UpdateStatus::Error { checked_at: now, message: "offline".into(), during_install: false };
+        assert_eq!(install_failure(Some(&check_error), now), None, "Fehler einer Prüfung bleibt still");
+        assert_eq!(install_failure(Some(&UpdateStatus::None { checked_at: now }), now), None);
+        assert_eq!(install_failure(Some(&available(true)), now), None);
+        assert_eq!(install_failure(None, now), None);
+    }
+
+    #[test]
+    fn install_failure_banner_comes_first() {
+        let security = available(true);
+        assert_eq!(
+            select_banner(Some("Hash"), Some(&security), false),
+            Banner::InstallFailed { message: "Hash".into() }
+        );
+        // Nach „Schließen“ (kein Installationsfehler mehr) erscheint der normale Hinweis.
+        assert_eq!(select_banner(None, Some(&security), false), Banner::Security { version: "0.1.1".into() });
+        assert_eq!(select_banner(None, None, false), Banner::Hidden);
+    }
+
+    #[test]
+    fn manual_check_notice() {
+        assert_eq!(
+            check_notice(&UpdateStatus::None { checked_at: 1 }),
+            Some(("Kein Update verfügbar".to_string(), false))
+        );
+        let err = UpdateStatus::Error { checked_at: 1, message: "Netzwerkfehler: offline".into(), during_install: false };
+        assert_eq!(
+            check_notice(&err),
+            Some(("Update-Prüfung fehlgeschlagen: Netzwerkfehler: offline".to_string(), true))
+        );
+        // Diese Ergebnisse zeigt die Hinweisleiste.
+        assert_eq!(check_notice(&available(false)), None);
+        let rejected = UpdateStatus::Rejected { checked_at: 1, version: v("0.1.1"), reason: "Signatur".into() };
+        assert_eq!(check_notice(&rejected), None);
     }
 
     #[test]
@@ -191,5 +306,7 @@ mod tests {
         assert!(!is_fresh(&s, 101));
         assert!(is_fresh(&s, 100));
         assert!(is_fresh(&s, 50));
+        // Ein Installationsfehler ist nie das Ergebnis einer Prüfung.
+        assert!(!is_fresh(&install_error(100), 50));
     }
 }

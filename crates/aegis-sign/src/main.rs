@@ -174,7 +174,7 @@ fn keygen(args: &[String]) -> Result<(), String> {
         key_path.display(),
         pub_path.display()
     );
-    eprintln!("Diese Zeile in aegis-update/src/keys.rs (TRUSTED_KEYS) eintragen:");
+    eprintln!("Diese Zeile in crates/aegis-update/src/keys.rs (TRUSTED_KEYS) eintragen:");
     println!("{}", pk.to_base64());
     Ok(())
 }

@@ -20,7 +20,7 @@ use aegis_update::{
 use crate::{
     fetch::{Curl, Fetch},
     github::{check, check_releases},
-    install::{cleanup_old, download_verified, replace_files},
+    install::{cleanup_old, download_verified, replace_files, restore_missing},
 };
 
 /// Befehl von der Kommandozeile.
@@ -66,10 +66,12 @@ fn status_from(decision: &Decision, checked_at: u64) -> UpdateStatus {
     }
 }
 
-fn error_status(e: &UpdateError) -> UpdateStatus {
+/// `during_install`: Fehler bei `--install`; die App zeigt ihn nach dem Neustart an.
+fn error_status(e: &UpdateError, during_install: bool) -> UpdateStatus {
     UpdateStatus::Error {
         checked_at: now(),
         message: e.to_string(),
+        during_install,
     }
 }
 
@@ -94,7 +96,7 @@ fn run_check(fetch: &dyn Fetch) -> UpdateStatus {
     }
     match check(fetch, installed(), TRUSTED_KEYS, now()) {
         Ok(decision) => status_from(&decision, now()),
-        Err(e) => error_status(&e),
+        Err(e) => error_status(&e, false),
     }
 }
 
@@ -136,22 +138,36 @@ fn start_aegis(target: &Path) {
         .spawn();
 }
 
+/// Status nach `--install`; jeder Fehler ist als Installationsfehler markiert.
+fn install_status(result: &Result<Installed, UpdateError>, at: u64) -> UpdateStatus {
+    match result {
+        Ok(Installed::Updated) => UpdateStatus::None { checked_at: at },
+        Ok(Installed::NotAvailable(status)) => status.clone(),
+        Ok(Installed::StillRunning) => UpdateStatus::Error {
+            checked_at: at,
+            message: "Aegis wurde nicht rechtzeitig beendet.".into(),
+            during_install: true,
+        },
+        Err(e) => UpdateStatus::Error {
+            checked_at: at,
+            message: e.to_string(),
+            during_install: true,
+        },
+    }
+}
+
 fn run_install(fetch: &dyn Fetch, wait_pid: u32) {
     let target = match target_dir() {
         Ok(t) => t,
-        Err(e) => return save_status(&error_status(&e)),
+        Err(e) => return save_status(&error_status(&e, true)),
     };
-    match install(fetch, &target, wait_pid) {
-        Ok(Installed::Updated) => save_status(&UpdateStatus::None { checked_at: now() }),
-        Ok(Installed::NotAvailable(status)) => save_status(&status),
-        Ok(Installed::StillRunning) => {
-            return save_status(&UpdateStatus::Error {
-                checked_at: now(),
-                message: "Aegis wurde nicht rechtzeitig beendet.".into(),
-            })
-        }
-        Err(e) => save_status(&error_status(&e)),
+    let result = install(fetch, &target, wait_pid);
+    save_status(&install_status(&result, now()));
+    if matches!(result, Ok(Installed::StillRunning)) {
+        return; // Aegis läuft noch: kein zweites Fenster starten
     }
+    // Nach einem Abbruch mitten im Ersetzen fehlt aegis.exe womöglich: alte Datei zurückholen.
+    restore_missing(&target);
     start_aegis(&target);
 }
 

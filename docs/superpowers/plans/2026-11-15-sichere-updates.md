@@ -27,6 +27,7 @@
 
 - Manifest mit gültiger Signatur, aber unbekannten zusätzlichen Feldern oder falschem `schema` → abgelehnt (Test in Task 1: `unknown_schema_rejected`, serde `deny_unknown_fields`).
 - `--install` während eine andere Instanz von Aegis noch läuft (andere PID) → Ersetzen scheitert sauber mit Rollback (Test in Task 4: `replace_rolls_back_when_target_locked` simuliert gesperrte Datei per offenem Handle).
+  - Korrektur (finaler Review): Windows erlaubt das Umbenennen einer laufenden `.exe`; eine zweite laufende Aegis-Instanz verhindert `--install` also **nicht**. Der Test bildet nur eine Datei mit exklusivem offenem Handle ab (z. B. Virenscanner), keine laufende Instanz. Eine Single-Instance-Sperre ist nicht Teil dieser Runde.
 - `update.json` beschädigt oder von älterem Schema → App zeigt nichts und stürzt nicht ab (Test in Task 5: `corrupt_status_shows_nothing`).
 - Systemuhr falsch (weit in der Zukunft/Vergangenheit) → bei Zukunft gilt das Manifest als abgelaufen (stale), bei `issued_at` > jetzt + 1 Tag ebenfalls abgelehnt (Test in Task 1: `issued_in_future_rejected`).
 - Updater-Ordner nicht beschreibbar → Fehlermeldung in `update.json`, alte Dateien bleiben (Test in Task 4: `readonly_target_keeps_old_files`).

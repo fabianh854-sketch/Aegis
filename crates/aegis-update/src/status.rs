@@ -16,11 +16,31 @@ use crate::{manifest::UpdateError, version::Version};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum UpdateStatus {
-    None { checked_at: u64 },
-    Available { checked_at: u64, version: Version, security: bool },
-    Stale { checked_at: u64, version: Version, expired_at: u64 },
-    Rejected { checked_at: u64, version: Version, reason: String },
-    Error { checked_at: u64, message: String },
+    None {
+        checked_at: u64,
+    },
+    Available {
+        checked_at: u64,
+        version: Version,
+        security: bool,
+    },
+    Stale {
+        checked_at: u64,
+        version: Version,
+        expired_at: u64,
+    },
+    Rejected {
+        checked_at: u64,
+        version: Version,
+        reason: String,
+    },
+    Error {
+        checked_at: u64,
+        message: String,
+        /// `true`: Fehler bei `--install` (nicht bei einer Prüfung). Fehlt in älteren Dateien.
+        #[serde(default)]
+        during_install: bool,
+    },
 }
 
 impl UpdateStatus {
@@ -125,10 +145,31 @@ mod tests {
         let path = dir.join("update.json");
         let all = [
             UpdateStatus::None { checked_at: 1 },
-            UpdateStatus::Available { checked_at: 2, version: v("0.2.0"), security: true },
-            UpdateStatus::Stale { checked_at: 3, version: v("0.2.0"), expired_at: 99 },
-            UpdateStatus::Rejected { checked_at: 4, version: v("0.2.0"), reason: "Signatur".into() },
-            UpdateStatus::Error { checked_at: 5, message: "offline".into() },
+            UpdateStatus::Available {
+                checked_at: 2,
+                version: v("0.2.0"),
+                security: true,
+            },
+            UpdateStatus::Stale {
+                checked_at: 3,
+                version: v("0.2.0"),
+                expired_at: 99,
+            },
+            UpdateStatus::Rejected {
+                checked_at: 4,
+                version: v("0.2.0"),
+                reason: "Signatur".into(),
+            },
+            UpdateStatus::Error {
+                checked_at: 5,
+                message: "offline".into(),
+                during_install: false,
+            },
+            UpdateStatus::Error {
+                checked_at: 6,
+                message: "Hash".into(),
+                during_install: true,
+            },
         ];
         for (i, s) in all.iter().enumerate() {
             write_status(&path, s).unwrap();
@@ -137,6 +178,27 @@ mod tests {
         }
         let json = fs::read_to_string(&path).unwrap();
         assert!(json.contains("\"status\":\"error\""), "{json}");
+        assert!(json.contains("\"during_install\":true"), "{json}");
+    }
+
+    #[test]
+    fn old_error_without_during_install_still_parses() {
+        // So schrieb der Updater vor dem Feld `during_install`.
+        let dir = temp_dir("old-error");
+        let path = dir.join("update.json");
+        fs::write(
+            &path,
+            r#"{"status":"error","checked_at":9,"message":"offline"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_status(&path),
+            Some(UpdateStatus::Error {
+                checked_at: 9,
+                message: "offline".into(),
+                during_install: false
+            })
+        );
     }
 
     #[test]
@@ -163,7 +225,10 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("update.json")]);
-        assert_eq!(read_status(&path), Some(UpdateStatus::None { checked_at: 2 }));
+        assert_eq!(
+            read_status(&path),
+            Some(UpdateStatus::None { checked_at: 2 })
+        );
     }
 
     #[test]
@@ -171,7 +236,10 @@ mod tests {
         let dir = temp_dir("parent");
         let path = dir.join("Aegis").join("update.json");
         write_status(&path, &UpdateStatus::None { checked_at: 7 }).unwrap();
-        assert_eq!(read_status(&path), Some(UpdateStatus::None { checked_at: 7 }));
+        assert_eq!(
+            read_status(&path),
+            Some(UpdateStatus::None { checked_at: 7 })
+        );
     }
 
     #[test]
