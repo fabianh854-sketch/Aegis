@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aegis-core", "crates/aegis-app", "crates/aegis-update"]
+members = ["crates/aegis-core", "crates/aegis-app", "crates/aegis-update", "crates/aegis-sign"]
 
 [workspace.package]
 edition = "2021"

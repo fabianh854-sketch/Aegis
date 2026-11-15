@@ -150,6 +150,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-sign"
+version = "0.1.0"
+dependencies = [
+ "aegis-update",
+ "minisign",
+ "serde_json",
+]
+
+[[package]]
 name = "aegis-update"
 version = "0.1.0"
 dependencies = [
