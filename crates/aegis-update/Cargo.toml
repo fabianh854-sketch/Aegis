@@ -2,6 +2,7 @@
 name = "aegis-update"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 minisign-verify = "0.3"
