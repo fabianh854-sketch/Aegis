@@ -1,0 +1,131 @@
+#Requires -Version 7
+<#
+.SYNOPSIS
+    Erneuert das Manifest des Releases mit der höchsten Version (wöchentlich ausführen!).
+
+.DESCRIPTION
+    Manifeste sind nur 7 Tage gültig (Schutz davor, dass ein neues Release versteckt wird). Dieses Skript lädt
+    Manifest und Signatur des veröffentlichten Releases mit der höchsten Version (kein Entwurf, kein Vorab-Release;
+    dasselbe Release, das der Updater als neuestes ansieht), lässt sie vom
+    Signierwerkzeug prüfen und mit neuem Gültigkeitszeitraum neu signieren (Passwortabfrage durch das Werkzeug;
+    dieses Skript sieht das Passwort nie) und ersetzt beide Dateien im Release. Version, Prüfsummen und
+    min_secure bleiben unverändert; das Skript prüft das vor dem Hochladen und bricht sonst ab.
+
+    Das Signierwerkzeug wird aus dem aktuell ausgecheckten, sauberen Stand gebaut. Prüfe vorher, dass dieser Stand
+    der geprüfte ist (git log -1).
+#>
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+# Exit-Codes nativer Befehle prüfen die Hilfsfunktionen selbst; nicht vom Wert in $PROFILE abhängen.
+$PSNativeCommandUseErrorActionPreference = $false
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$Repo = 'fabianh854-sketch/Aegis'
+$Work = $null
+
+. (Join-Path $PSScriptRoot 'release-helpers.ps1')
+
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$ArgList = @())
+    & $Exe @ArgList
+    if ($LASTEXITCODE -ne 0) {
+        throw "Befehl fehlgeschlagen (Exit $LASTEXITCODE): $Exe $($ArgList -join ' ')"
+    }
+}
+
+function Get-NativeOutput {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$ArgList = @())
+    $out = & $Exe @ArgList
+    if ($LASTEXITCODE -ne 0) {
+        throw "Befehl fehlgeschlagen (Exit $LASTEXITCODE): $Exe $($ArgList -join ' ')"
+    }
+    return ,@($out)   # Komma: auch bei einer einzigen Zeile ein Array liefern
+}
+
+try {
+    foreach ($tool in 'git', 'cargo', 'gh') {
+        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+            throw "Das Werkzeug '$tool' wurde nicht gefunden."
+        }
+    }
+    $RepoRoot = Split-Path -Parent $PSScriptRoot
+    Set-Location $RepoRoot
+
+    $dirty = Get-NativeOutput git @('status', '--porcelain')
+    if ($dirty.Count -gt 0) {
+        throw "Der Arbeitsbaum ist nicht sauber. Das Signierwerkzeug wird aus diesem Stand gebaut und bekommt dein Passwort; deshalb nur mit sauberem, geprüftem Stand:`n$($dirty -join "`n")"
+    }
+    Write-Host 'Signierwerkzeug wird gebaut aus:' -ForegroundColor Cyan
+    Invoke-Native git @('-c', 'core.quotepath=off', 'log', '-1', '--format=%h %an %s')
+
+    $KeyFile = Join-Path $env:USERPROFILE '.aegis-signing\aegis.key'
+    if (-not (Test-Path -LiteralPath $KeyFile -PathType Leaf)) {
+        throw "Der Signierschlüssel $KeyFile fehlt."
+    }
+
+    & gh auth status *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'gh ist nicht angemeldet. Erst "gh auth login" ausführen.' }
+
+    # Veröffentlichtes Release mit der höchsten Version (wie der Updater), nicht das zuletzt veröffentlichte.
+    $latest = Select-LatestRelease (Get-AegisReleases -Repo $Repo)
+    if (-not $latest) { throw 'Es gibt noch kein veröffentlichtes Release.' }
+    $tag = $latest.tagName
+    Write-Host "Release mit der höchsten Version: $tag" -ForegroundColor Cyan
+
+    $assets = $latest.assets
+    if (($assets -notcontains 'aegis-manifest.json') -or ($assets -notcontains 'aegis-manifest.json.minisig')) {
+        throw "Das Release $tag enthält kein Manifest samt Signatur (aegis-manifest.json und aegis-manifest.json.minisig). Es kann nichts erneuert werden."
+    }
+
+    # Frischer Arbeitsordner pro Lauf.
+    $Work = Join-Path $env:TEMP "aegis-refresh-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $inDir = Join-Path $Work 'in'
+    $outDir = Join-Path $Work 'out'
+    New-Item -ItemType Directory -Path $inDir, $outDir | Out-Null
+
+    Invoke-Native gh @('release', 'download', $tag, '--repo', $Repo, '--dir', $inDir,
+        '-p', 'aegis-manifest.json', '-p', 'aegis-manifest.json.minisig')
+
+    Invoke-Native cargo @('build', '--release', '--locked', '-p', 'aegis-sign')
+    $meta = (Get-NativeOutput cargo @('metadata', '--no-deps', '--format-version', '1', '--locked')) -join "`n" | ConvertFrom-Json
+    $signExe = Join-Path $meta.target_directory 'release\aegis-sign.exe'
+    if (-not (Test-Path -LiteralPath $signExe -PathType Leaf)) { throw "Erwartete Datei fehlt nach dem Build: $signExe" }
+
+    Write-Host ''
+    Write-Host 'Gleich fragt das Signierwerkzeug nach dem Passwort des Schlüssels.' -ForegroundColor Cyan
+    # Ohne Ausgabeumleitung aufrufen, damit die Passwortabfrage am Terminal funktioniert.
+    & $signExe refresh --key $KeyFile `
+        --manifest (Join-Path $inDir 'aegis-manifest.json') `
+        --sig (Join-Path $inDir 'aegis-manifest.json.minisig') `
+        --out $outDir
+    if ($LASTEXITCODE -ne 0) { throw "Das Erneuern ist fehlgeschlagen (Exit $LASTEXITCODE)." }
+
+    foreach ($f in 'aegis-manifest.json', 'aegis-manifest.json.minisig') {
+        if (-not (Test-Path -LiteralPath (Join-Path $outDir $f) -PathType Leaf)) { throw "Datei fehlt nach dem Erneuern: $f" }
+    }
+
+    # Gegenprobe vor dem Überschreiben: Nur die Gültigkeitszeit darf sich geändert haben.
+    $oldManifest = Get-Content -LiteralPath (Join-Path $inDir 'aegis-manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $newManifest = Get-Content -LiteralPath (Join-Path $outDir 'aegis-manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $problems = Test-RefreshedManifest -Old $oldManifest -New $newManifest -Tag $tag
+    if ($problems.Count -gt 0) {
+        throw "Das erneuerte Manifest weicht vom bisherigen ab; nichts hochgeladen:`n$($problems -join "`n")"
+    }
+
+    Invoke-Native gh @('release', 'upload', $tag, '--repo', $Repo, '--clobber',
+        (Join-Path $outDir 'aegis-manifest.json'), (Join-Path $outDir 'aegis-manifest.json.minisig'))
+
+    Write-Host ''
+    Write-Host "Fertig: Das Manifest von $tag ist für weitere 7 Tage gültig. Nächste Erneuerung spätestens in 7 Tagen." -ForegroundColor Green
+    Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+}
+catch {
+    Write-Host ''
+    Write-Host "Abbruch: $($_.Exception.Message)" -ForegroundColor Red
+    if ($Work -and (Test-Path -LiteralPath $Work)) {
+        Write-Host "Der Arbeitsordner bleibt zur Fehlersuche erhalten: $Work" -ForegroundColor Yellow
+    }
+    exit 1
+}

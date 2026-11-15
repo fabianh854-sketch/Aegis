@@ -1,0 +1,11 @@
+[package]
+name = "aegis-sign"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+aegis-update = { path = "../aegis-update" }
+minisign = "0.10"
+rpassword = "7"
+serde_json = "1"

@@ -7,17 +7,25 @@ use eframe::egui::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use aegis_update::UpdateStatus;
+
 use crate::{
     clipboard::{ClipboardGuard, SystemClipboard},
-    generator,
+    generator, settings,
     task::Task,
     theme,
+    updates::{self, Banner},
 };
 
 const AUTO_LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
 const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
 const STATUS_VISIBLE_FOR: Duration = Duration::from_secs(4);
 const TITLE_BAR_HEIGHT: f32 = 40.0;
+const BANNER_HEIGHT: f32 = 36.0;
+/// Wie oft die Statusdatei des Updaters nach dem Start gelesen wird.
+const UPDATE_POLL_EVERY: Duration = Duration::from_secs(2);
+/// So lange wird höchstens auf das Ergebnis der Update-Prüfung gewartet.
+const UPDATE_POLL_FOR: Duration = Duration::from_secs(2 * 60);
 const SIDEBAR_OPEN_WIDTH: f32 = 220.0;
 const SIDEBAR_CLOSED_WIDTH: f32 = 56.0;
 /// Mindestlänge für neue oder geänderte Master-Passwörter (in Zeichen, nicht Bytes).
@@ -44,6 +52,24 @@ struct Editor {
 struct Settings {
     auto_lock: bool,
     clear_clipboard: bool,
+}
+
+/// Wartet auf das Ergebnis einer laufenden Update-Prüfung des Updaters.
+struct UpdatePoll {
+    /// Startzeit (Unix-Sekunden): nur Ergebnisse ab diesem Zeitpunkt zählen.
+    started_at: u64,
+    give_up_at: Instant,
+    next_read: Instant,
+    /// „Jetzt nach Updates suchen“: auch „kein Update“ und Fehler melden (die Startprüfung bleibt still).
+    manual: bool,
+}
+
+/// Klick in der Hinweisleiste.
+enum BannerAction {
+    Install,
+    Later,
+    /// Installationsfehler gelesen und geschlossen.
+    DismissInstallFailure,
 }
 
 pub struct AegisApp {
@@ -73,10 +99,20 @@ pub struct AegisApp {
     gen_password: Zeroizing<String>,
     // Einstellungen
     settings: Settings,
+    /// Dauerhafte Einstellungen (`settings.json`).
+    persisted: settings::Persisted,
     show_master_form: bool,
     current_master: Zeroizing<String>,
     new_master: Zeroizing<String>,
     new_master_confirm: Zeroizing<String>,
+    // Updates
+    updater: Option<PathBuf>,
+    update_poll: Option<UpdatePoll>,
+    update_status: Option<UpdateStatus>,
+    /// „Später“ gilt nur für diese Sitzung der App.
+    update_dismissed: bool,
+    /// Fehler der letzten Installation (beim Start einmal aus `update.json` gelesen), bis er geschlossen wird.
+    install_failure: Option<String>,
 }
 
 impl Default for AegisApp {
@@ -108,10 +144,101 @@ impl Default for AegisApp {
             gen_opts,
             gen_password,
             settings: Settings { auto_lock: true, clear_clipboard: true },
+            persisted: settings::Persisted::default(),
             show_master_form: false,
             current_master: Zeroizing::default(),
             new_master: Zeroizing::default(),
             new_master_confirm: Zeroizing::default(),
+            updater: None,
+            update_poll: None,
+            update_status: None,
+            update_dismissed: false,
+            install_failure: None,
+        }
+    }
+}
+
+impl AegisApp {
+    /// Startet die App: lädt die Einstellungen und sucht bei Bedarf im Hintergrund nach Updates.
+    pub fn new() -> Self {
+        let mut app = Self::default();
+        if let Some(path) = settings::path() {
+            app.persisted = settings::load(&path);
+        }
+        app.updater = updates::updater_path();
+        // Genau einmal und vor der Startprüfung lesen: Diese überschreibt update.json gleich.
+        let last = aegis_update::status_path().and_then(|path| aegis_update::read_status(&path));
+        app.install_failure = updates::install_failure(last.as_ref(), aegis_update::now());
+        if app.persisted.check_updates_on_start {
+            // Ein Fehler beim Start der Prüfung ist hier kein Grund zu stören; „Jetzt suchen“ zeigt ihn.
+            let _ = app.start_update_check(false);
+        }
+        app
+    }
+
+    /// Startet `--check` und wartet danach auf ein frisches Ergebnis in `update.json`.
+    fn start_update_check(&mut self, manual: bool) -> std::io::Result<()> {
+        let updater = self
+            .updater
+            .clone()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Updater nicht gefunden"))?;
+        let started_at = aegis_update::now();
+        updates::spawn_check(&updater)?;
+        let now = Instant::now();
+        self.update_poll = Some(UpdatePoll {
+            started_at,
+            give_up_at: now + UPDATE_POLL_FOR,
+            next_read: now + UPDATE_POLL_EVERY,
+            manual,
+        });
+        Ok(())
+    }
+
+    /// Liest alle 2 s die Statusdatei, bis ein Ergebnis dieser Prüfung da ist (höchstens 2 Minuten).
+    fn poll_update_status(&mut self, ctx: &egui::Context, now: Instant) {
+        let Some(poll) = &mut self.update_poll else { return };
+        if now >= poll.next_read {
+            poll.next_read = now + UPDATE_POLL_EVERY;
+            let fresh = aegis_update::status_path()
+                .and_then(|path| aegis_update::read_status(&path))
+                .filter(|status| updates::is_fresh(status, poll.started_at));
+            if let Some(status) = fresh {
+                let manual = poll.manual;
+                self.update_poll = None;
+                if manual {
+                    match updates::check_notice(&status) {
+                        Some((text, error)) => self.set_status(text, error),
+                        // Ausdrücklich gesucht: ein früheres „Später“ gilt dann nicht mehr.
+                        None => self.update_dismissed = false,
+                    }
+                }
+                self.update_status = Some(status);
+                return;
+            }
+        }
+        if now >= poll.give_up_at {
+            let manual = poll.manual;
+            self.update_poll = None;
+            if manual {
+                self.set_status(updates::CHECK_TIMEOUT_NOTICE, true);
+            }
+        } else {
+            ctx.request_repaint_after(poll.next_read.saturating_duration_since(now));
+        }
+    }
+
+    /// „Aktualisieren“: sperrt, startet den Updater und schließt die App, damit er sie ersetzen kann.
+    fn install_update(&mut self, ctx: &egui::Context) {
+        let Some(updater) = self.updater.clone() else {
+            self.set_status("Updater konnte nicht gestartet werden: nicht gefunden", true);
+            return;
+        };
+        if self.session.is_some() {
+            self.lock(); // leert auch die Zwischenablage, falls so eingestellt
+        }
+        match updates::spawn_install(&updater) {
+            Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+            Err(e) => self.set_status(format!("Updater konnte nicht gestartet werden: {e}"), true),
         }
     }
 }
@@ -151,6 +278,8 @@ impl eframe::App for AegisApp {
             ctx.request_repaint_after(next);
         }
 
+        self.poll_update_status(ctx, now);
+
         if let Some(task) = &self.pending {
             match task.poll() {
                 Some(result) => {
@@ -181,12 +310,36 @@ impl eframe::App for AegisApp {
                 self.sidebar_open = !self.sidebar_open;
             }
 
-            let content = Rect::from_min_max(egui::pos2(app_rect.left(), title_rect.bottom()), app_rect.max);
+            // Hinweisleiste direkt unter der Titelleiste; der Inhalt rückt entsprechend nach unten.
+            let banner = updates::select_banner(
+                self.install_failure.as_deref(),
+                self.update_status.as_ref(),
+                self.update_dismissed,
+            );
+            let mut content_top = title_rect.bottom();
+            let mut banner_action = None;
+            if banner != Banner::Hidden {
+                let banner_rect = Rect::from_min_size(
+                    egui::pos2(app_rect.left(), content_top),
+                    egui::vec2(app_rect.width(), BANNER_HEIGHT),
+                );
+                banner_action = banner_bar(ui, banner_rect, &banner);
+                content_top += BANNER_HEIGHT;
+            }
+
+            let content = Rect::from_min_max(egui::pos2(app_rect.left(), content_top), app_rect.max);
             let mut content_ui = ui.new_child(UiBuilder::new().max_rect(content).layout(Layout::top_down(Align::Min)));
             if unlocked {
                 self.main_view(&mut content_ui);
             } else {
                 self.unlock_view(&mut content_ui);
+            }
+
+            match banner_action {
+                Some(BannerAction::Install) => self.install_update(ctx),
+                Some(BannerAction::Later) => self.update_dismissed = true,
+                Some(BannerAction::DismissInstallFailure) => self.install_failure = None,
+                None => {}
             }
         });
     }
@@ -828,6 +981,34 @@ impl AegisApp {
                 &mut self.settings.clear_clipboard,
                 52.0,
             );
+            if toggle_row(
+                ui,
+                "Beim Start nach Updates suchen",
+                None,
+                &mut self.persisted.check_updates_on_start,
+                52.0,
+            ) {
+                self.save_persisted();
+            }
+
+            ui.horizontal(|ui| {
+                ui.set_min_height(52.0);
+                ui.label(RichText::new("Updates").size(15.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.updater.is_some() {
+                        let busy = self.update_poll.is_some();
+                        let button = theme::secondary_button("Jetzt nach Updates suchen").min_size(egui::vec2(0.0, 34.0));
+                        if ui.add_enabled(!busy, button).clicked() {
+                            match self.start_update_check(true) {
+                                Ok(()) => self.set_status("Suche nach Updates…", false),
+                                Err(e) => self.set_status(format!("Updater konnte nicht gestartet werden: {e}"), true),
+                            }
+                        }
+                    } else {
+                        ui.label(theme::muted("Updater nicht gefunden", 13.0));
+                    }
+                });
+            });
 
             ui.horizontal(|ui| {
                 ui.set_min_height(66.0);
@@ -882,6 +1063,17 @@ impl AegisApp {
 
         if change_master {
             self.change_master();
+        }
+    }
+
+    /// Speichert die dauerhaften Einstellungen sofort; Fehler erscheinen rot in der Statusleiste.
+    fn save_persisted(&mut self) {
+        let result = match settings::path() {
+            Some(path) => settings::save(&path, &self.persisted).map_err(|e| e.to_string()),
+            None => Err("APPDATA nicht gesetzt".to_string()),
+        };
+        if let Err(e) = result {
+            self.set_status(format!("Einstellung konnte nicht gespeichert werden: {e}"), true);
         }
     }
 
@@ -1039,6 +1231,50 @@ fn title_bar(
         ui.ctx().send_viewport_cmd(ViewportCommand::Close);
     }
     toggled
+}
+
+/// Hinweisleiste (36 px) unter der Titelleiste. Gibt zurück, welcher Knopf gedrückt wurde.
+fn banner_bar(ui: &mut egui::Ui, rect: Rect, banner: &Banner) -> Option<BannerAction> {
+    let text = updates::banner_text(banner)?;
+    let danger = matches!(banner, Banner::Security { .. } | Banner::Rejected { .. } | Banner::InstallFailed { .. });
+    let (fill, color) = match banner {
+        _ if danger => (theme::DANGER.gamma_multiply(0.14), theme::DANGER),
+        Banner::Stale { .. } => (theme::SURFACE, theme::MUTED),
+        _ => (theme::SURFACE_HI, theme::TEXT),
+    };
+    ui.painter().rect_filled(rect, Rounding::ZERO, fill);
+    ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, theme::BORDER));
+
+    let mut action = None;
+    let inner = rect.shrink2(egui::vec2(16.0, 0.0));
+    let mut bar = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
+    bar.add(egui::Label::new(RichText::new(text).size(14.0).color(color)).truncate());
+    bar.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        // Von rechts nach links: der Hauptknopf steht ganz rechts.
+        let small = egui::vec2(0.0, 26.0);
+        match banner {
+            Banner::Security { .. } => {
+                if ui.add(theme::accent_button("Jetzt aktualisieren").min_size(small)).clicked() {
+                    action = Some(BannerAction::Install);
+                }
+            }
+            Banner::Update { .. } => {
+                if ui.add(theme::accent_button("Aktualisieren").min_size(small)).clicked() {
+                    action = Some(BannerAction::Install);
+                }
+                if ui.add(theme::secondary_button("Später").min_size(small)).clicked() {
+                    action = Some(BannerAction::Later);
+                }
+            }
+            Banner::InstallFailed { .. } => {
+                if ui.add(theme::secondary_button("Schließen").min_size(small)).clicked() {
+                    action = Some(BannerAction::DismissInstallFailure);
+                }
+            }
+            Banner::Hidden | Banner::Stale { .. } | Banner::Rejected { .. } => {}
+        }
+    });
+    action
 }
 
 /// Mini-Schild aus `assets/icon/aegis-mark-32.png` (erzeugt aus `aegis-mark.svg`).

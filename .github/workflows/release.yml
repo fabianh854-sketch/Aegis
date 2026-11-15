@@ -1,10 +1,13 @@
-# Baut Aegis für Windows und veröffentlicht ein GitHub-Release, sobald ein Tag wie v0.1.0 gepusht wird.
+# Baut und testet Aegis für Windows, sobald ein Tag wie v0.1.0 gepusht wird.
 #
 #   git tag v0.1.0
 #   git push origin v0.1.0
 #
+# Dieser Workflow VERÖFFENTLICHT NICHTS. Release-Dateien werden lokal gebaut und lokal signiert
+# (scripts\release.ps1); sonst könnte ein manipulierter Workflow unsignierte Dateien neben die echten legen.
+# Hier läuft nur eine unabhängige Gegenprobe: Tag zur Version passend, Tests grün, Release-Build baut.
+#
 # Der Tag muss zur Version in Cargo.toml ([workspace.package] version) passen, sonst bricht der Lauf ab.
-# Tags mit Bindestrich (z. B. v0.2.0-beta.1) werden als Vorabversion veröffentlicht.
 
 name: Release
 
@@ -25,7 +28,7 @@ jobs:
     name: Windows x64
     runs-on: windows-latest
     permissions:
-      contents: write # Release anlegen und Dateien hochladen
+      contents: read
     env:
       CARGO_TERM_COLOR: always
       TAG: ${{ github.ref_name }}
@@ -62,34 +65,4 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Release-Build
-        run: cargo build --release --locked -p aegis-app
-
-      - name: Paket schnüren
-        run: |
-          $name = "aegis-$env:TAG-windows-x64"
-          $stage = Join-Path $env:RUNNER_TEMP $name
-          New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage 'licenses') | Out-Null
-          Copy-Item target/release/aegis-app.exe (Join-Path $stage 'aegis.exe')
-          Copy-Item README.md, LICENSE -Destination $stage
-          # Die eingebetteten Schriften stehen unter der SIL OFL 1.1; die Lizenz muss mitgeliefert werden.
-          Copy-Item crates/aegis-app/assets/fonts/OFL-*.txt -Destination (Join-Path $stage 'licenses')
-
-          $zip = "$name.zip"
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
-          "ASSET=$zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
-      - name: GitHub-Release anlegen
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ghArgs = @(
-            'release', 'create', $env:TAG, $env:ASSET, "$env:ASSET.sha256",
-            '--repo', $env:GITHUB_REPOSITORY,
-            '--title', "Aegis $env:TAG",
-            '--generate-notes',
-            '--verify-tag'
-          )
-          if ($env:TAG.Contains('-')) { $ghArgs += '--prerelease' }
-          gh @ghArgs
+        run: cargo build --release --locked -p aegis-app -p aegis-updater
