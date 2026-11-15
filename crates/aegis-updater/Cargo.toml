@@ -2,6 +2,7 @@
 name = "aegis-updater"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 aegis-update = { path = "../aegis-update" }

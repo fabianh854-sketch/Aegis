@@ -1,11 +1,34 @@
 # cargo-deny: prüft Lizenzen, Sicherheitslücken und verbotene Netzwerk-Crates.
 # Aufruf: cargo deny check
 
+# Aegis wird nur für Windows gebaut. Linux-/macOS-Abhängigkeiten von eframe (z. B. zbus, wayland)
+# landen nie in der ausgelieferten .exe und werden deshalb nicht geprüft.
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
 [advisories]
 yanked = "deny"
+ignore = [
+    # `paste` ist ein Proc-Makro (läuft nur beim Kompilieren, kein Code in der .exe) und gilt als
+    # nicht mehr gepflegt – keine Sicherheitslücke. Kommt über eframe 0.29 → accesskit_windows.
+    # Erledigt sich mit einem egui/eframe-Upgrade.
+    { id = "RUSTSEC-2024-0436", reason = "Build-Zeit-Makro über eframe 0.29, nicht gepflegt, keine Lücke" },
+    # `ttf-parser` liest in egui die Schriften (eframe 0.29 → epaint → ab_glyph). Nicht mehr gepflegt,
+    # aber keine bekannte Lücke. Aegis lädt nur die fest in der .exe eingebetteten Schriften, nie
+    # Schriftdateien von außen. Erledigt sich mit einem egui/eframe-Upgrade.
+    { id = "RUSTSEC-2026-0192", reason = "Nur eingebettete Schriften, kein fremder Input; über eframe 0.29, keine Lücke" },
+]
 
 [licenses]
 allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+# Gezielte Ausnahmen nur für die Crates, die sie brauchen (alle frei und OSI- bzw. FSF-anerkannt).
+exceptions = [
+    # Boost-Lizenz: Windows-Zwischenablage (über arboard).
+    { allow = ["BSL-1.0"], crate = "clipboard-win" },
+    { allow = ["BSL-1.0"], crate = "error-code" },
+    # Eingebettete Standard-Schriften von egui.
+    { allow = ["OFL-1.1", "LicenseRef-UFL-1.0"], crate = "epaint_default_fonts" },
+]
 
 [bans]
 multiple-versions = "warn"
