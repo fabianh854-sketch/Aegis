@@ -3,8 +3,10 @@
 mod app;
 mod clipboard;
 mod generator;
+mod settings;
 mod task;
 mod theme;
+mod updates;
 
 use app::AegisApp;
 use eframe::egui;
@@ -27,7 +29,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             theme::install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(AegisApp::default()))
+            Ok(Box::new(AegisApp::new()))
         }),
     )
 }
