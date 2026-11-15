@@ -91,6 +91,32 @@ pub fn self_check(json: &[u8], sig: &str, keys: &[&str], now: u64) -> Result<Man
     verify(json, sig, keys, now).map_err(|e| format!("Selbstprüfung fehlgeschlagen: {e}"))
 }
 
+/// Vorheriges Manifest: Signatur gegen dieselbe Schlüsselliste prüfen wie die Selbstprüfung.
+pub fn verify_previous(
+    json: &[u8],
+    sig: &str,
+    keys: &[&str],
+    now: u64,
+) -> Result<Manifest, String> {
+    self_check(json, sig, keys, now).map_err(|e| format!("Vorheriges Manifest: {e}"))
+}
+
+/// `--previous` und `--previous-sig` gehören zusammen.
+pub fn previous_paths<'a>(
+    manifest: Option<&'a str>,
+    sig: Option<&'a str>,
+) -> Result<Option<(&'a str, &'a str)>, String> {
+    match (manifest, sig) {
+        (None, None) => Ok(None),
+        (Some(m), Some(s)) => Ok(Some((m, s))),
+        (Some(_), None) => Err(
+            "--previous braucht auch --previous-sig (die Signatur des vorherigen Manifests)."
+                .to_string(),
+        ),
+        (None, Some(_)) => Err("--previous-sig ohne --previous angegeben.".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +218,51 @@ mod tests {
         let err = self_check(b"{}", "x", &[], NOW).unwrap_err();
         assert!(err
             .contains("Kein vertrauenswürdiger Schlüssel in aegis-update/src/keys.rs eingetragen"));
+    }
+
+    fn signed_previous(m: &Manifest) -> (Vec<u8>, String, String) {
+        let kp = KeyPair::generate_unencrypted_keypair().unwrap();
+        let json = serde_json::to_vec(m).unwrap();
+        let sig = sign_bytes(&kp.sk, &kp.pk, &json, m.version).unwrap();
+        (json, sig, kp.pk.to_base64())
+    }
+
+    #[test]
+    fn verified_previous_carries_min_secure() {
+        let prev = previous();
+        let (json, sig, pk) = signed_previous(&prev);
+        let verified = verify_previous(&json, &sig, &[&pk], NOW).unwrap();
+        let m = build_manifest(v(0, 2, 1), false, Some(&verified), &files(), NOW).unwrap();
+        assert_eq!(m.min_secure, prev.min_secure);
+    }
+
+    #[test]
+    fn tampered_previous_is_rejected() {
+        let (mut json, sig, pk) = signed_previous(&previous());
+        json.push(b' ');
+        let err = verify_previous(&json, &sig, &[&pk], NOW).unwrap_err();
+        assert!(err.contains("Vorheriges Manifest"));
+        // Andere Schlüsselliste: ebenfalls abgelehnt.
+        let (json, sig, _) = signed_previous(&previous());
+        let other = KeyPair::generate_unencrypted_keypair()
+            .unwrap()
+            .pk
+            .to_base64();
+        assert!(verify_previous(&json, &sig, &[&other], NOW).is_err());
+    }
+
+    #[test]
+    fn previous_requires_signature_argument() {
+        assert_eq!(previous_paths(None, None).unwrap(), None);
+        assert_eq!(
+            previous_paths(Some("m"), Some("s")).unwrap(),
+            Some(("m", "s"))
+        );
+        assert!(previous_paths(Some("m"), None)
+            .unwrap_err()
+            .contains("--previous-sig"));
+        assert!(previous_paths(None, Some("s"))
+            .unwrap_err()
+            .contains("--previous"));
     }
 }

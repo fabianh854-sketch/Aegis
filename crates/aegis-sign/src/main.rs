@@ -20,7 +20,7 @@ fn usage() -> String {
     "Verwendung:\n  \
      aegis-sign keygen --dir <ordner>\n  \
      aegis-sign manifest --version X.Y.Z --key <aegis.key> --app <aegis.exe> \
-     --updater <aegis-updater.exe> [--previous <manifest.json>] [--security] --out <ordner>\n  \
+     --updater <aegis-updater.exe> [--previous <manifest.json> --previous-sig <manifest.json.minisig>] [--security] --out <ordner>\n  \
      aegis-sign refresh --key <aegis.key> --manifest <json> --sig <minisig> --out <ordner>"
         .to_string()
 }
@@ -107,6 +107,24 @@ fn require_trusted_keys() -> Result<(), String> {
     Ok(())
 }
 
+const MIN_PASSWORD_CHARS: usize = 12;
+
+/// Regel für das Schlüsselpasswort: nicht leer, mindestens 12 Zeichen (nicht Bytes), Wiederholung gleich.
+fn check_new_password(pw: &str, confirm: &str) -> Result<(), String> {
+    if pw.is_empty() {
+        return Err("Das Passwort darf nicht leer sein.".to_string());
+    }
+    if pw.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(format!(
+            "Das Passwort muss mindestens {MIN_PASSWORD_CHARS} Zeichen lang sein."
+        ));
+    }
+    if pw != confirm {
+        return Err("Die Passwörter stimmen nicht überein.".to_string());
+    }
+    Ok(())
+}
+
 fn keygen(args: &[String]) -> Result<(), String> {
     let (values, _) = parse_flags(args, &["dir"], &[])?;
     let dir = required(&values, "dir")?;
@@ -119,6 +137,12 @@ fn keygen(args: &[String]) -> Result<(), String> {
             pub_path.display()
         ));
     }
+    // Passwort vor dem Anlegen der Dateien abfragen und prüfen.
+    let password = rpassword::prompt_password("Passwort für den Signierschlüssel: ")
+        .map_err(|e| format!("Passwort lesen: {e}"))?;
+    let confirm = rpassword::prompt_password("Passwort wiederholen: ")
+        .map_err(|e| format!("Passwort lesen: {e}"))?;
+    check_new_password(&password, &confirm)?;
     fs::create_dir_all(&dir).map_err(|e| format!("{} anlegen: {e}", dir.display()))?;
     // create_new: schlägt fehl, falls die Datei inzwischen existiert.
     let open = |p: &Path| {
@@ -136,16 +160,15 @@ fn keygen(args: &[String]) -> Result<(), String> {
             return Err(e);
         }
     };
-    // Passwortabfrage (zweimal) übernimmt minisign.
-    let KeyPair { pk, .. } = KeyPair::generate_and_write_encrypted_keypair(
-        pub_file, key_file, None, None,
-    )
-    .map_err(|e| {
-        // Unvollständige Dateien nicht stehen lassen.
-        let _ = fs::remove_file(&key_path);
-        let _ = fs::remove_file(&pub_path);
-        format!("Schlüsselerzeugung fehlgeschlagen: {e}")
-    })?;
+    // Das geprüfte Passwort wird ausdrücklich übergeben (keine minisign-Abfrage).
+    let KeyPair { pk, .. } =
+        KeyPair::generate_and_write_encrypted_keypair(pub_file, key_file, None, Some(password))
+            .map_err(|e| {
+                // Unvollständige Dateien nicht stehen lassen.
+                let _ = fs::remove_file(&key_path);
+                let _ = fs::remove_file(&pub_path);
+                format!("Schlüsselerzeugung fehlgeschlagen: {e}")
+            })?;
     eprintln!(
         "Schlüssel gespeichert: {} (verschlüsselt, sicher aufbewahren) und {}.",
         key_path.display(),
@@ -160,7 +183,15 @@ fn manifest(args: &[String]) -> Result<(), String> {
     require_trusted_keys()?;
     let (values, on) = parse_flags(
         args,
-        &["version", "key", "app", "updater", "previous", "out"],
+        &[
+            "version",
+            "key",
+            "app",
+            "updater",
+            "previous",
+            "previous-sig",
+            "out",
+        ],
         &["security"],
     )?;
     let version: Version = values
@@ -173,11 +204,17 @@ fn manifest(args: &[String]) -> Result<(), String> {
     let app = read(&required(&values, "app")?)?;
     let updater = read(&required(&values, "updater")?)?;
     let out = required(&values, "out")?;
-    let previous: Option<Manifest> = match values.get("previous") {
-        Some(p) => Some(
-            serde_json::from_slice(&read(Path::new(p))?)
-                .map_err(|e| format!("--previous ist kein gültiges Manifest: {e}"))?,
-        ),
+    let previous: Option<Manifest> = match build::previous_paths(
+        values.get("previous").map(String::as_str),
+        values.get("previous-sig").map(String::as_str),
+    )? {
+        Some((json_path, sig_path)) => {
+            let json = read(Path::new(json_path))?;
+            let sig = String::from_utf8(read(Path::new(sig_path))?)
+                .map_err(|_| "Die Signaturdatei des vorherigen Manifests ist kein Text.")?;
+            // Nur ein verifiziertes Manifest darf min_secure liefern.
+            Some(build::verify_previous(&json, &sig, TRUSTED_KEYS, now())?)
+        }
         None => None,
     };
     let at = now();
@@ -266,5 +303,20 @@ mod tests {
         assert!(err.contains("nichts überschrieben"));
         assert_eq!(fs::read(dir.join("aegis.key")).unwrap(), b"vorhanden");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn password_rules() {
+        assert!(check_new_password("", "").unwrap_err().contains("leer"));
+        assert!(check_new_password("abcdefghijk", "abcdefghijk")
+            .unwrap_err()
+            .contains("12 Zeichen"));
+        assert!(check_new_password("abcdefghijkl", "abcdefghijkl").is_ok());
+        // 12 Umlaute = 24 Bytes, aber nur 12 Zeichen; 11 Umlaute = 22 Bytes, zu kurz.
+        assert!(check_new_password("äöüäöüäöüäöü", "äöüäöüäöüäöü").is_ok());
+        assert!(check_new_password("äöüäöüäöüäö", "äöüäöüäöüäö").is_err());
+        assert!(check_new_password("abcdefghijkl", "abcdefghijkm")
+            .unwrap_err()
+            .contains("stimmen nicht überein"));
     }
 }

@@ -155,6 +155,7 @@ version = "0.1.0"
 dependencies = [
  "aegis-update",
  "minisign",
+ "rpassword",
  "serde_json",
 ]
 
