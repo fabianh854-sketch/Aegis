@@ -8,9 +8,12 @@
       1. Vorprüfungen (alle lokal, vor jeder Passwortabfrage): sauberer Arbeitsbaum, Tag v<Version> zeigt auf HEAD,
          Cargo-Version = <Version>, TRUSTED_KEYS in keys.rs nicht leer.
       2. Netz-Vorprüfungen: gh angemeldet, Tag liegt auf GitHub auf demselben Commit, Release existiert noch nicht.
+         Vorgänger = höchste veröffentlichte Version unter <Version>. Fehlt ihm Manifest oder Signatur, bricht das
+         Skript ab (außer beim allerersten signierten Release mit -FirstSignedRelease).
       3. Alle Commits seit dem letzten Release werden angezeigt; Weiter nur nach Eingabe von "geprüft".
       4. cargo deny, Tests, Release-Build, Cargo.lock unverändert.
-      5. Manifest bauen und signieren (das Werkzeug fragt das Schlüsselpasswort selbst ab; dieses Skript sieht es nie).
+      5. Übernommenes min_secure anzeigen und bestätigen lassen (j/n), dann Manifest bauen und signieren
+         (das Werkzeug fragt das Schlüsselpasswort selbst ab; dieses Skript sieht es nie).
       6. Zip + .sha256 bauen, Release mit allen Dateien auf GitHub veröffentlichen.
 
     Gebaut wird in einem frischen Ordner unter $env:TEMP; ins Repository wird nie geschrieben.
@@ -21,16 +24,25 @@
 
 .PARAMETER Security
     Markiert das Release als Sicherheitsupdate: min_secure wird auf diese Version gesetzt.
+
+.PARAMETER FirstSignedRelease
+    Nur für das allererste Release mit Manifest: erlaubt einen Vorgänger ohne Manifest (oder gar keinen), dann beginnt
+    min_secure bei 0.0.0 (bzw. bei dieser Version mit -Security). Wird abgelehnt, sobald irgendein Release auf GitHub
+    ein aegis-manifest.json enthält.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [string]$Version,
 
-    [switch]$Security
+    [switch]$Security,
+
+    [switch]$FirstSignedRelease
 )
 
 $ErrorActionPreference = 'Stop'
+# Exit-Codes nativer Befehle prüfen die Hilfsfunktionen selbst; nicht vom Wert in $PROFILE abhängen.
+$PSNativeCommandUseErrorActionPreference = $false
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $Repo = 'fabianh854-sketch/Aegis'
@@ -57,16 +69,13 @@ function Get-NativeOutput {
     return ,@($out)   # Komma: auch bei einer einzigen Zeile ein Array liefern
 }
 
+. (Join-Path $PSScriptRoot 'release-helpers.ps1')
+
 # Liest die TRUSTED_KEYS-Konstante direkt aus keys.rs (Kommentare werden ignoriert) und liefert die Schlüssel.
 # Unlesbares oder unerwartetes Format zählt als "keine Schlüssel" (Abbruch, nie Weitermachen).
 function Get-TrustedKeys {
     param([Parameter(Mandatory)][string]$Path)
-    $src = Get-Content -LiteralPath $Path -Raw -Encoding utf8
-    $src = [regex]::Replace($src, '/\*.*?\*/', '', 'Singleline')
-    $src = [regex]::Replace($src, '//[^\r\n]*', '')
-    $m = [regex]::Match($src, 'TRUSTED_KEYS\s*:\s*&\[\s*&str\s*\]\s*=\s*&\[(?<body>[^\]]*)\]\s*;')
-    if (-not $m.Success) { return @() }
-    return @([regex]::Matches($m.Groups['body'].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+    return Get-TrustedKeysFromSource -Source (Get-Content -LiteralPath $Path -Raw -Encoding utf8)
 }
 
 $OldRustFlags = $env:RUSTFLAGS
@@ -75,7 +84,8 @@ $Failed = $true
 
 try {
     # ---------------------------------------------------------------- 1. lokale Vorprüfungen
-    if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    # Wie der Updater: nur Ziffern, keine führenden Nullen.
+    if ($Version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or -not (ConvertTo-AegisVersion $Version)) {
         throw "Ungültige Version '$Version'. Erlaubt ist nur X.Y.Z, z. B. 0.1.1 (ohne führendes v, ohne Zusatz)."
     }
     foreach ($tool in 'git', 'cargo', 'gh') {
@@ -144,29 +154,50 @@ try {
         throw "Der Tag $Tag liegt auf GitHub auf $($remoteTag.Substring(0, 7)), nicht auf HEAD ($($head.Substring(0, 7)))."
     }
 
-    $releases = (Get-NativeOutput gh @('release', 'list', '--repo', $Repo, '--exclude-drafts', '--exclude-pre-releases',
-            '--json', 'tagName,publishedAt', '--limit', '100')) -join "`n" | ConvertFrom-Json
-    if ($releases | Where-Object { $_.tagName -eq $Tag }) {
-        throw "Zu $Tag gibt es auf GitHub schon ein Release. Ein veröffentlichtes Release wird nicht überschrieben."
+    # Alle Releases (alle Seiten, auch Entwürfe und Vorab-Releases) samt Dateinamen.
+    $allReleases = Get-AegisReleases -Repo $Repo
+    $newVersion = ConvertTo-AegisVersion $Version
+    foreach ($r in $allReleases) {
+        $rv = ConvertTo-AegisVersion $r.tagName
+        if ($r.tagName -eq $Tag -or ($rv -and (Compare-AegisVersion $rv $newVersion) -eq 0)) {
+            throw "Zu $Tag gibt es auf GitHub schon ein Release ($($r.tagName)), einen Entwurf oder ein Vorab-Release. Ein Release wird nicht überschrieben."
+        }
     }
     & gh release view $Tag --repo $Repo *> $null
     if ($LASTEXITCODE -eq 0) {
         throw "Zu $Tag gibt es auf GitHub schon einen Entwurf oder ein Vorab-Release. Erst entfernen oder aufräumen."
     }
+    $highest = Select-LatestRelease $allReleases
+    if ($highest -and (Compare-AegisVersion $highest.Version $newVersion) -gt 0) {
+        throw "Es gibt schon ein höheres veröffentlichtes Release ($($highest.tagName)). Die neue Version muss die höchste sein."
+    }
 
-    # Vorheriges Release = neuestes veröffentlichtes (kein Entwurf, kein Vorab-Release) vor diesem Tag.
-    $prev = $releases | Sort-Object { [datetime]$_.publishedAt } -Descending | Select-Object -First 1
+    # Vorgänger = höchste veröffentlichte Version unter dieser (wie der Updater vergleicht), nicht das zuletzt veröffentlichte.
+    $prev = Select-PreviousRelease -Releases $allReleases -Version $Version
     $prevTag = if ($prev) { $prev.tagName } else { $null }
 
     $prevHasManifest = $false
     if ($prevTag) {
-        $assets = ((Get-NativeOutput gh @('release', 'view', $prevTag, '--repo', $Repo, '--json', 'assets')) -join "`n" | ConvertFrom-Json).assets.name
-        $hasManifest = $assets -contains 'aegis-manifest.json'
-        $hasSig = $assets -contains 'aegis-manifest.json.minisig'
+        $hasManifest = $prev.assets -contains 'aegis-manifest.json'
+        $hasSig = $prev.assets -contains 'aegis-manifest.json.minisig'
         if ($hasManifest -and -not $hasSig) {
             throw "Das vorherige Release $prevTag hat ein Manifest, aber keine Signatur (aegis-manifest.json.minisig). Das ist nicht in Ordnung; erst klären."
         }
         $prevHasManifest = $hasManifest -and $hasSig
+    }
+    if ($prevHasManifest -and $FirstSignedRelease) {
+        throw "-FirstSignedRelease ist nicht erlaubt: Das vorherige Release $prevTag hat bereits ein signiertes Manifest."
+    }
+    if (-not $prevHasManifest) {
+        $why = if ($prevTag) { "Das vorherige Release $prevTag enthält kein Manifest samt Signatur." } else { 'Es gibt kein vorheriges Release.' }
+        if (-not $FirstSignedRelease) {
+            throw "$why Ohne signiertes Vorgänger-Manifest ginge min_secure verloren (Beginn bei 0.0.0). Nur beim allerersten signierten Release mit -FirstSignedRelease erlaubt."
+        }
+        if (Test-AnyReleaseHasManifest $allReleases) {
+            $with = @($allReleases | Where-Object { @($_.assets) -contains 'aegis-manifest.json' } | ForEach-Object { $_.tagName }) -join ', '
+            throw "$why -FirstSignedRelease wird abgelehnt: Diese Releases haben schon ein Manifest: $with. Das passt nicht zu einem ersten signierten Release; erst klären."
+        }
+        Write-Warning "$why Erstes signiertes Release (-FirstSignedRelease): min_secure beginnt bei 0.0.0, mit -Security bei $Version."
     }
 
     # ---------------------------------------------------------------- 3. Prüfung der Änderungen
@@ -243,6 +274,8 @@ try {
     $signArgs = @('manifest', '--version', $Version, '--key', $KeyFile,
         '--app', (Join-Path $upload 'aegis.exe'), '--updater', (Join-Path $upload 'aegis-updater.exe'))
 
+    $carried = '0.0.0'
+    $carriedFrom = 'Beginn (erstes signiertes Release)'
     if ($prevHasManifest) {
         $prevDir = Join-Path $Stage 'previous'
         New-Item -ItemType Directory -Path $prevDir | Out-Null
@@ -250,20 +283,31 @@ try {
         Write-Host "Lade Manifest und Signatur des vorherigen Releases $prevTag ..." -ForegroundColor Cyan
         Invoke-Native gh @('release', 'download', $prevTag, '--repo', $Repo, '--dir', $prevDir,
             '-p', 'aegis-manifest.json', '-p', 'aegis-manifest.json.minisig')
+        # Nur zur Anzeige gelesen; die Signatur prüft gleich das Signierwerkzeug gegen TRUSTED_KEYS (sonst Abbruch).
+        $prevManifest = Get-Content -LiteralPath (Join-Path $prevDir 'aegis-manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+        if ([string]$prevManifest.version -cne $prev.Version.Text) {
+            throw "Das Manifest von $prevTag nennt die Version '$($prevManifest.version)', erwartet $($prev.Version.Text)."
+        }
+        $prevMin = ConvertTo-AegisVersion ([string]$prevManifest.min_secure)
+        if (-not $prevMin -or [string]$prevManifest.min_secure -cne $prevMin.Text) {
+            throw "Das Manifest von $prevTag enthält kein gültiges min_secure ('$($prevManifest.min_secure)')."
+        }
+        $carried = $prevMin.Text
+        $carriedFrom = "übernommen aus $prevTag (Signatur prüft gleich das Signierwerkzeug)"
         # --previous und --previous-sig gehören immer zusammen: Nur ein signiertes Manifest darf min_secure liefern.
         $signArgs += @('--previous', (Join-Path $prevDir 'aegis-manifest.json'),
             '--previous-sig', (Join-Path $prevDir 'aegis-manifest.json.minisig'))
     }
-    else {
-        $why = if ($prevTag) { "Das vorherige Release $prevTag enthält kein Manifest (vor dem Update-System erstellt)." } else { 'Es gibt kein vorheriges Release.' }
-        Write-Host ''
-        Write-Warning "$why min_secure beginnt deshalb bei 0.0.0, es sei denn, -Security ist angegeben."
-        if (-not $Security) {
-            Write-Warning 'Ohne -Security gilt für dieses Release: min_secure = 0.0.0 (kein Nutzer sieht es als Sicherheitsupdate).'
-        }
-    }
+    $expectedMinSecure = if ($Security) { $Version } else { $carried }
     if ($Security) { $signArgs += '--security' }
     $signArgs += @('--out', $upload)
+
+    Write-Host ''
+    Write-Host '== min_secure ==' -ForegroundColor Cyan
+    Write-Host "Bisheriges min_secure: $carried ($carriedFrom)"
+    Write-Host "min_secure des neuen Manifests: $expectedMinSecure$(if ($Security) { ' (Sicherheitsupdate: diese Version)' } else { ' (unverändert übernommen)' })" -ForegroundColor Yellow
+    $okMin = Read-Host 'Stimmt das? Erst danach wird signiert. (j/n)'
+    if ($okMin -ne 'j') { throw 'min_secure nicht bestätigt. Es wurde nichts signiert oder veröffentlicht.' }
 
     Write-Host ''
     Write-Host '== Manifest signieren ==' -ForegroundColor Cyan
@@ -280,6 +324,7 @@ try {
     $manifest = Get-Content -LiteralPath (Join-Path $upload 'aegis-manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     if ($manifest.version -ne $Version) { throw "Das Manifest enthält die Version $($manifest.version), erwartet $Version." }
     if ([bool]$manifest.security -ne [bool]$Security) { throw 'Das Sicherheits-Kennzeichen im Manifest passt nicht zum Schalter -Security.' }
+    if ([string]$manifest.min_secure -cne $expectedMinSecure) { throw "min_secure im Manifest ist $($manifest.min_secure), bestätigt war $expectedMinSecure." }
     foreach ($name in 'aegis.exe', 'aegis-updater.exe') {
         $entry = $manifest.files | Where-Object { $_.name -eq $name }
         $actual = (Get-FileHash -LiteralPath (Join-Path $upload $name) -Algorithm SHA256).Hash.ToLowerInvariant()

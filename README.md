@@ -45,9 +45,9 @@ Releases werden **lokal gebaut und signiert**, nicht in GitHub Actions. `.github
 
 1. **Einmalig:** `pwsh scripts\new-signing-key.ps1` erzeugt das Schlüsselpaar in `%USERPROFILE%\.aegis-signing\` (Passwort mit mindestens 12 Zeichen). Den ausgegebenen öffentlichen Schlüssel in `crates/aegis-update/src/keys.rs` (`TRUSTED_KEYS`) und im README unter „Download prüfen“ eintragen, beides committen. `aegis.key` zusätzlich offline sichern und nie committen. Solange `TRUSTED_KEYS` leer ist, lehnt alles ab.
 2. **Pro Release:** Version in `Cargo.toml` erhöhen, committen, Tag `vX.Y.Z` auf diesen Commit setzen und pushen, dann
-   `pwsh scripts\release.ps1 -Version X.Y.Z` (bei einem Sicherheitsupdate zusätzlich `-Security`).
+   `pwsh scripts\release.ps1 -Version X.Y.Z` (bei einem Sicherheitsupdate zusätzlich `-Security`; beim allerersten Release mit Manifest einmalig `-FirstSignedRelease`, sonst bricht das Skript ab, wenn dem Vorgänger ein signiertes Manifest fehlt).
    Das Skript bricht ab bei schmutzigem Arbeitsbaum, falschem Tag, falscher Cargo-Version oder leerem `TRUSTED_KEYS`. Es zeigt alle Commits seit dem letzten Release und verlangt die Eingabe `geprüft`, führt `cargo deny check`, die Tests und den Release-Build aus, baut Manifest und Zip, fragt das Schlüsselpasswort (das Skript speichert es nie) und veröffentlicht das Release mit Zip, `.sha256`, `aegis.exe`, `aegis-updater.exe`, Manifest und Signatur.
-3. **Wöchentlich:** `pwsh scripts\refresh-manifest.ps1`. Manifeste laufen nach 7 Tagen ab; wird das vergessen, meldet der Updater „Update-Status nicht bestätigt“. Das Skript signiert das Manifest des neuesten Releases mit neuem Gültigkeitszeitraum neu (Version, Prüfsummen und `min_secure` bleiben gleich).
+3. **Wöchentlich:** `pwsh scripts\refresh-manifest.ps1`. Manifeste laufen nach 7 Tagen ab; wird das vergessen, meldet der Updater „Update-Status nicht bestätigt“. Das Skript signiert das Manifest des Releases mit der höchsten Version mit neuem Gültigkeitszeitraum neu (Version, Prüfsummen und `min_secure` bleiben gleich; das Skript prüft das vor dem Hochladen).
 
 ## Download prüfen
 

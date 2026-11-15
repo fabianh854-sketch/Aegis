@@ -1,14 +1,15 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-    Erneuert das Manifest des neuesten Releases (wöchentlich ausführen!).
+    Erneuert das Manifest des Releases mit der höchsten Version (wöchentlich ausführen!).
 
 .DESCRIPTION
     Manifeste sind nur 7 Tage gültig (Schutz davor, dass ein neues Release versteckt wird). Dieses Skript lädt
-    Manifest und Signatur des neuesten veröffentlichten Releases (kein Entwurf, kein Vorab-Release), lässt sie vom
+    Manifest und Signatur des veröffentlichten Releases mit der höchsten Version (kein Entwurf, kein Vorab-Release;
+    dasselbe Release, das der Updater als neuestes ansieht), lässt sie vom
     Signierwerkzeug prüfen und mit neuem Gültigkeitszeitraum neu signieren (Passwortabfrage durch das Werkzeug;
     dieses Skript sieht das Passwort nie) und ersetzt beide Dateien im Release. Version, Prüfsummen und
-    min_secure bleiben unverändert.
+    min_secure bleiben unverändert; das Skript prüft das vor dem Hochladen und bricht sonst ab.
 
     Das Signierwerkzeug wird aus dem aktuell ausgecheckten, sauberen Stand gebaut. Prüfe vorher, dass dieser Stand
     der geprüfte ist (git log -1).
@@ -17,10 +18,14 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+# Exit-Codes nativer Befehle prüfen die Hilfsfunktionen selbst; nicht vom Wert in $PROFILE abhängen.
+$PSNativeCommandUseErrorActionPreference = $false
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $Repo = 'fabianh854-sketch/Aegis'
 $Work = $null
+
+. (Join-Path $PSScriptRoot 'release-helpers.ps1')
 
 function Invoke-Native {
     param([Parameter(Mandatory)][string]$Exe, [string[]]$ArgList = @())
@@ -63,15 +68,13 @@ try {
     & gh auth status *> $null
     if ($LASTEXITCODE -ne 0) { throw 'gh ist nicht angemeldet. Erst "gh auth login" ausführen.' }
 
-    # Neuestes veröffentlichtes Release (kein Entwurf, kein Vorab-Release).
-    $releases = (Get-NativeOutput gh @('release', 'list', '--repo', $Repo, '--exclude-drafts', '--exclude-pre-releases',
-            '--json', 'tagName,publishedAt', '--limit', '100')) -join "`n" | ConvertFrom-Json
-    $latest = $releases | Sort-Object { [datetime]$_.publishedAt } -Descending | Select-Object -First 1
+    # Veröffentlichtes Release mit der höchsten Version (wie der Updater), nicht das zuletzt veröffentlichte.
+    $latest = Select-LatestRelease (Get-AegisReleases -Repo $Repo)
     if (-not $latest) { throw 'Es gibt noch kein veröffentlichtes Release.' }
     $tag = $latest.tagName
-    Write-Host "Neuestes Release: $tag" -ForegroundColor Cyan
+    Write-Host "Release mit der höchsten Version: $tag" -ForegroundColor Cyan
 
-    $assets = ((Get-NativeOutput gh @('release', 'view', $tag, '--repo', $Repo, '--json', 'assets')) -join "`n" | ConvertFrom-Json).assets.name
+    $assets = $latest.assets
     if (($assets -notcontains 'aegis-manifest.json') -or ($assets -notcontains 'aegis-manifest.json.minisig')) {
         throw "Das Release $tag enthält kein Manifest samt Signatur (aegis-manifest.json und aegis-manifest.json.minisig). Es kann nichts erneuert werden."
     }
@@ -101,6 +104,14 @@ try {
 
     foreach ($f in 'aegis-manifest.json', 'aegis-manifest.json.minisig') {
         if (-not (Test-Path -LiteralPath (Join-Path $outDir $f) -PathType Leaf)) { throw "Datei fehlt nach dem Erneuern: $f" }
+    }
+
+    # Gegenprobe vor dem Überschreiben: Nur die Gültigkeitszeit darf sich geändert haben.
+    $oldManifest = Get-Content -LiteralPath (Join-Path $inDir 'aegis-manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $newManifest = Get-Content -LiteralPath (Join-Path $outDir 'aegis-manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $problems = Test-RefreshedManifest -Old $oldManifest -New $newManifest -Tag $tag
+    if ($problems.Count -gt 0) {
+        throw "Das erneuerte Manifest weicht vom bisherigen ab; nichts hochgeladen:`n$($problems -join "`n")"
     }
 
     Invoke-Native gh @('release', 'upload', $tag, '--repo', $Repo, '--clobber',

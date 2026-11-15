@@ -12,6 +12,8 @@
 param()
 
 $ErrorActionPreference = 'Stop'
+# Exit-Codes nativer Befehle prüfen die Hilfsfunktionen selbst; nicht vom Wert in $PROFILE abhängen.
+$PSNativeCommandUseErrorActionPreference = $false
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 try {
