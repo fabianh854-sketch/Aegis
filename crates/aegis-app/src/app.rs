@@ -9,7 +9,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     clipboard::{ClipboardGuard, SystemClipboard},
-    generator, theme,
+    generator,
+    task::Task,
+    theme,
 };
 
 const AUTO_LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
@@ -50,12 +52,14 @@ pub struct AegisApp {
     // Entsperren
     password: Zeroizing<String>,
     confirm: Zeroizing<String>,
-    /// Formular „Neu anlegen“ ist offen. Nur möglich, solange keine Tresor-Datei existiert.
-    creating: bool,
+    /// Läuft gerade Entsperren/Anlegen im Hintergrund (Argon2)?
+    pending: Option<Task<Session>>,
     // Sitzung
     session: Option<Session>,
     nav: Nav,
     sidebar_open: bool,
+    /// Mini-Schild für die Titelleiste, wird beim ersten Frame hochgeladen.
+    mark: Option<egui::TextureHandle>,
     search: String,
     focus_search: bool,
     editor: Option<Editor>,
@@ -88,10 +92,11 @@ impl Default for AegisApp {
             path,
             password: Zeroizing::default(),
             confirm: Zeroizing::default(),
-            creating: false,
+            pending: None,
             session: None,
             nav: Nav::Entries,
-            sidebar_open: true,
+            sidebar_open: false, // Standard: eingeklappt, nur Symbole
+            mark: None,
             search: String::new(),
             focus_search: false,
             editor: None,
@@ -146,17 +151,35 @@ impl eframe::App for AegisApp {
             ctx.request_repaint_after(next);
         }
 
+        if let Some(task) = &self.pending {
+            match task.poll() {
+                Some(result) => {
+                    self.pending = None;
+                    self.finish_unlock(result);
+                }
+                None => ctx.request_repaint_after(Duration::from_millis(100)),
+            }
+        }
+
         // Ein Fenster ohne Windows-Rahmen: eigener Rand mit Radius 12 und eigene Titelleiste.
         let window = egui::Frame::none()
             .fill(theme::PANEL)
             .stroke(Stroke::new(1.0, theme::BORDER))
             .rounding(Rounding::same(12.0));
+        let mark = self
+            .mark
+            .get_or_insert_with(|| ctx.load_texture("aegis-mark", title_mark_image(), egui::TextureOptions::LINEAR))
+            .id();
         egui::CentralPanel::default().frame(window).show(ctx, |ui| {
             let app_rect = ui.max_rect();
             let title_rect = Rect::from_min_size(app_rect.min, egui::vec2(app_rect.width(), TITLE_BAR_HEIGHT));
             let unlocked = self.session.is_some();
             let status = if unlocked { self.status.as_str() } else { "" };
-            title_bar(ui, title_rect, status, self.status_error);
+            // Der Seitenleisten-Knopf erscheint nur dort, wo es eine Seitenleiste gibt.
+            let toggle = (unlocked && self.editor.is_none()).then_some(self.sidebar_open);
+            if title_bar(ui, title_rect, mark, status, self.status_error, toggle) {
+                self.sidebar_open = !self.sidebar_open;
+            }
 
             let content = Rect::from_min_max(egui::pos2(app_rect.left(), title_rect.bottom()), app_rect.max);
             let mut content_ui = ui.new_child(UiBuilder::new().max_rect(content).layout(Layout::top_down(Align::Min)));
@@ -203,64 +226,62 @@ impl AegisApp {
     // ---- Entsperren (Entwurf 01) -------------------------------------------
 
     fn unlock_view(&mut self, ui: &mut egui::Ui) {
-        let exists = self.path.as_ref().is_ok_and(|p| p.exists());
-        let creating = self.creating && !exists;
+        // Ersteinrichtung genau dann, wenn es noch keine Tresordatei gibt.
+        let first_start = self.path.as_ref().is_ok_and(|p| !p.exists());
+        let busy = self.pending.is_some();
+        let texts = unlock_texts(first_start, busy);
 
         // Spalte 320 px breit, senkrecht und waagerecht mittig.
-        let height = if creating { 390.0 } else { 310.0 };
+        let height = if first_start { 410.0 } else { 310.0 };
         let column = Rect::from_center_size(ui.max_rect().center(), egui::vec2(320.0, height));
         let mut ui = ui.new_child(UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)));
         ui.spacing_mut().item_spacing.y = 8.0;
 
         ui.vertical_centered(|ui| {
-            let title = if creating { "Tresor anlegen" } else { "Tresor entsperren" };
-            ui.label(theme::heading(title, 34.0));
+            // Der längere Titel der Ersteinrichtung passt sonst nicht in die 320 px.
+            ui.label(theme::heading(texts.title, if first_start { 27.0 } else { 34.0 }));
         });
         ui.add_space(12.0);
-        ui.label(
-            RichText::new("Dein Master-Passwort öffnet den Tresor. Er bleibt lokal auf diesem Gerät.")
-                .size(14.0)
-                .color(theme::MUTED),
-        );
+        let intro = if first_start {
+            "Willkommen bei Aegis. Dieses Passwort öffnet deinen Tresor und lässt sich nicht wiederherstellen."
+        } else {
+            "Dein Master-Passwort öffnet den Tresor. Er bleibt lokal auf diesem Gerät."
+        };
+        ui.label(RichText::new(intro).size(14.0).color(theme::MUTED));
         ui.add_space(16.0);
 
-        ui.label(theme::muted("Master-Passwort", 13.0));
-        let first = ui.add(password_input(&mut self.password));
+        let label = if first_start { "Master-Passwort (mind. 12 Zeichen)" } else { "Master-Passwort" };
+        ui.label(theme::muted(label, 13.0));
+        let first = ui.add_enabled(!busy, password_input(&mut self.password));
         let mut enter = first.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-        if creating {
+        if first_start {
             ui.add_space(4.0);
             ui.label(theme::muted("Passwort bestätigen", 13.0));
-            let second = ui.add(password_input(&mut self.confirm));
+            let second = ui.add_enabled(!busy, password_input(&mut self.confirm));
             enter |= second.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         }
         ui.add_space(12.0);
 
-        let label = if creating { "Tresor anlegen" } else { "Entsperren" };
-        let button = egui::Button::new(theme::medium(label, 15.0).color(theme::ACCENT_TEXT))
+        let button = egui::Button::new(theme::medium(texts.button, 15.0).color(theme::ACCENT_TEXT))
             .fill(theme::ACCENT)
             .stroke(Stroke::NONE)
             .min_size(egui::vec2(320.0, 44.0));
         // Text mittig: egui richtet Button-Text nach dem Layout aus.
-        let clicked = ui.vertical_centered_justified(|ui| ui.add(button).clicked()).inner;
-        if clicked || enter {
-            self.unlock(creating);
+        let response = ui.vertical_centered_justified(|ui| ui.add_enabled(!busy, button)).inner;
+        if busy {
+            // Drehender Kreis links im Button, solange Argon2 im Hintergrund rechnet.
+            let spot = Rect::from_center_size(
+                egui::pos2(response.rect.left() + 26.0, response.rect.center().y),
+                egui::vec2(18.0, 18.0),
+            );
+            egui::Spinner::new().size(18.0).color(theme::ACCENT_TEXT).paint_at(&ui, spot);
+        }
+        if (response.clicked() || enter) && !busy {
+            let ctx = ui.ctx().clone();
+            self.unlock(first_start, ctx);
         }
         ui.add_space(12.0);
-
-        // „Neu anlegen“ nur, solange es keinen Tresor gibt. Sonst würde ein bestehender überschrieben.
-        if creating {
-            if ui.add(theme::link_button("Zurück zum Entsperren", theme::MUTED, 13.0)).clicked() {
-                self.creating = false;
-                self.confirm.clear();
-                self.status.clear();
-            }
-        } else if !exists
-            && ui.add(theme::link_button("Noch kein Tresor? Neu anlegen", theme::ACCENT, 13.0)).clicked()
-        {
-            self.creating = true;
-            self.status.clear();
-        }
 
         if let Err(problem) = &self.path {
             ui.add_space(4.0);
@@ -272,7 +293,11 @@ impl AegisApp {
         }
     }
 
-    fn unlock(&mut self, creating: bool) {
+    /// Prüft die Eingaben sofort und startet die Schlüsselableitung im Hintergrund.
+    fn unlock(&mut self, first_start: bool, ctx: egui::Context) {
+        if self.pending.is_some() {
+            return; // kein zweiter Vorgang, solange einer läuft
+        }
         let path = match &self.path {
             Ok(p) => p.clone(),
             Err(problem) => {
@@ -285,8 +310,7 @@ impl AegisApp {
             self.set_status("Bitte Master-Passwort eingeben", true);
             return;
         }
-
-        let result = if creating {
+        if first_start {
             if let Err(msg) = validate_new_master(&self.password, &self.confirm) {
                 self.set_status(msg, true);
                 return;
@@ -297,26 +321,34 @@ impl AegisApp {
                     return;
                 }
             }
-            Session::create(&path, self.password.as_bytes(), &KdfParams::default())
-        } else {
-            if !path.exists() {
-                self.set_status("Noch kein Tresor vorhanden. Lege zuerst einen an.", true);
-                return;
-            }
-            Session::open(&path, self.password.as_bytes())
-        };
+        }
 
+        let password = self.password.clone();
+        self.status.clear();
+        self.pending = Some(Task::spawn(
+            move || {
+                let result = if first_start {
+                    Session::create(&path, password.as_bytes(), &KdfParams::default())
+                } else {
+                    Session::open(&path, password.as_bytes())
+                };
+                result.map_err(|e| e.to_string())
+            },
+            move || ctx.request_repaint(),
+        ));
+    }
+
+    fn finish_unlock(&mut self, result: Result<Session, String>) {
         match result {
             Ok(session) => {
                 self.session = Some(session);
                 self.password.zeroize();
                 self.confirm.zeroize();
-                self.creating = false;
                 self.nav = Nav::Entries;
                 self.last_activity = Instant::now();
                 self.status.clear();
             }
-            Err(e) => self.set_status(e.to_string(), true),
+            Err(e) => self.set_status(e, true),
         }
     }
 
@@ -366,31 +398,7 @@ impl AegisApp {
         let inner = if open { outer.shrink2(egui::vec2(14.0, 20.0)) } else { outer.shrink2(egui::vec2(10.0, 20.0)) };
         let mut ui = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
 
-        // Auf-/Zuklappen: Kästchen 28 px mit ‹ bzw. ›
-        let chevron = if open {
-            Rect::from_min_size(egui::pos2(inner.right() - 6.0 - 28.0, inner.top()), egui::vec2(28.0, 28.0))
-        } else {
-            Rect::from_min_size(egui::pos2(inner.center().x - 14.0, inner.top()), egui::vec2(28.0, 28.0))
-        };
-        let response = ui.interact(chevron, egui::Id::new("sidebar_toggle"), Sense::click());
-        let painter = ui.painter();
-        if response.hovered() {
-            painter.rect_filled(chevron, 6.0, theme::SURFACE_HI);
-        }
-        painter.rect_stroke(chevron, 6.0, Stroke::new(1.0, theme::BORDER));
-        painter.text(
-            chevron.center(),
-            Align2::CENTER_CENTER,
-            if open { "‹" } else { "›" },
-            FontId::proportional(16.0),
-            theme::MUTED,
-        );
-        if response.clicked() {
-            self.sidebar_open = !open;
-        }
-        // Abstand unter dem Kästchen: aufgeklappt 18 px, eingeklappt 10 + 14 px Zwischenraum.
-        ui.add_space(28.0 + if open { 18.0 } else { 24.0 });
-
+        // Auf-/Zuklappen sitzt in der Titelleiste; die Navigation beginnt direkt oben.
         ui.spacing_mut().item_spacing.y = if open { 2.0 } else { 10.0 };
         if !open && nav_button(&mut ui, false, Icon::Search, "Suchen", open) {
             self.nav = Nav::Entries;
@@ -399,7 +407,7 @@ impl AegisApp {
         let items = [
             (Nav::Entries, Icon::List, "Alle Einträge"),
             (Nav::Generator, Icon::Key, "Passwortgenerator"),
-            (Nav::Settings, Icon::Sliders, "Einstellungen"),
+            (Nav::Settings, Icon::Gear, "Einstellungen"),
         ];
         for (nav, icon, label) in items {
             if nav_button(&mut ui, self.nav == nav, icon, label, open) {
@@ -410,7 +418,7 @@ impl AegisApp {
         let lock_width = if open { inner.width() } else { 36.0 };
         let lock_rect = Rect::from_min_size(egui::pos2(inner.left(), inner.bottom() - 36.0), egui::vec2(lock_width, 36.0));
         let mut lock_ui = ui.new_child(UiBuilder::new().max_rect(lock_rect));
-        if nav_button(&mut lock_ui, false, Icon::Lock, "Sperren", open) {
+        if nav_button(&mut lock_ui, false, Icon::Door, "Sperren", open) {
             self.lock();
         }
     }
@@ -916,6 +924,21 @@ impl AegisApp {
     }
 }
 
+struct UnlockTexts {
+    title: &'static str,
+    button: &'static str,
+}
+
+/// Überschrift und Button-Text des Entsperren-Bildschirms.
+fn unlock_texts(first_start: bool, busy: bool) -> UnlockTexts {
+    match (first_start, busy) {
+        (true, false) => UnlockTexts { title: "Master-Passwort festlegen", button: "Tresor anlegen" },
+        (true, true) => UnlockTexts { title: "Master-Passwort festlegen", button: "Wird angelegt…" },
+        (false, false) => UnlockTexts { title: "Tresor entsperren", button: "Entsperren" },
+        (false, true) => UnlockTexts { title: "Tresor entsperren", button: "Wird entsperrt…" },
+    }
+}
+
 /// Prüft ein neues Master-Passwort und seine Wiederholung.
 fn validate_new_master(new: &str, confirm: &str) -> Result<(), &'static str> {
     if new.is_empty() {
@@ -934,7 +957,16 @@ fn validate_new_master(new: &str, confirm: &str) -> Result<(), &'static str> {
 
 /// Titelleiste wie im Entwurf: Logo und „Aegis“ links, Minimieren und Schließen rechts.
 /// Ein Statushinweis (z. B. „Gespeichert“) steht links neben den Fensterknöpfen.
-fn title_bar(ui: &mut egui::Ui, rect: Rect, status: &str, status_error: bool) {
+/// `sidebar_toggle: Some(offen)` zeigt rechts neben „Aegis“ den Seitenleisten-Knopf.
+/// Gibt `true` zurück, wenn er geklickt wurde.
+fn title_bar(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    mark: egui::TextureId,
+    status: &str,
+    status_error: bool,
+    sidebar_toggle: Option<bool>,
+) -> bool {
     let drag = ui.interact(rect, egui::Id::new("title_bar"), Sense::click_and_drag());
     if drag.drag_started_by(egui::PointerButton::Primary) {
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
@@ -946,15 +978,34 @@ fn title_bar(ui: &mut egui::Ui, rect: Rect, status: &str, status_error: bool) {
     let minimize = ui.interact(min_rect, egui::Id::new("title_minimize"), Sense::click());
 
     let painter = ui.painter();
-    let logo = Rect::from_min_size(egui::pos2(rect.left() + 14.0, rect.center().y - 7.0), egui::vec2(14.0, 14.0));
-    painter.rect_filled(logo, 4.0, theme::ACCENT);
-    painter.text(
+    // Mini-Schild (32 px Bild, auf 16 px gezeichnet, damit es auch bei hoher Auflösung scharf bleibt).
+    let logo = Rect::from_min_size(egui::pos2(rect.left() + 13.0, rect.center().y - 8.0), egui::vec2(16.0, 16.0));
+    let full = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    painter.image(mark, logo, full, egui::Color32::WHITE);
+    let name = painter.text(
         egui::pos2(logo.right() + 8.0, rect.center().y),
         Align2::LEFT_CENTER,
         "Aegis",
         FontId::proportional(12.0),
         theme::MUTED,
     );
+
+    let mut toggled = false;
+    if let Some(open) = sidebar_toggle {
+        // 28 × 28, rahmenlos wie die Navigation; Hover-Fläche wie bei Minimieren.
+        let spot = Rect::from_center_size(egui::pos2(name.right() + 12.0 + 14.0, rect.center().y), egui::vec2(28.0, 28.0));
+        let label = if open { "Seitenleiste einklappen" } else { "Seitenleiste ausklappen" };
+        let response = ui.interact(spot, egui::Id::new("sidebar_toggle"), Sense::click()).on_hover_text(label);
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(spot, 6.0, theme::SURFACE_HI);
+        }
+        let color = if response.hovered() { theme::TEXT } else { theme::MUTED };
+        draw_sidebar_icon(painter, spot.center(), open, color);
+        toggled = response.clicked();
+    }
+
+    let painter = ui.painter();
 
     if !status.is_empty() {
         let color = if status_error { theme::DANGER } else { theme::MUTED };
@@ -987,6 +1038,28 @@ fn title_bar(ui: &mut egui::Ui, rect: Rect, status: &str, status_error: bool) {
     if close.clicked() {
         ui.ctx().send_viewport_cmd(ViewportCommand::Close);
     }
+    toggled
+}
+
+/// Mini-Schild aus `assets/icon/aegis-mark-32.png` (erzeugt aus `aegis-mark.svg`).
+fn title_mark_image() -> egui::ColorImage {
+    // Fest eingebettet: Ein Dekodierfehler wäre ein kaputter Build, kein Laufzeitfall.
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/aegis-mark-32.png"))
+        .expect("eingebettetes Mini-Schild ist ein gültiges PNG");
+    egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba)
+}
+
+/// Seitenleisten-Symbol: Fensterrahmen mit linker Spalte, die gefüllt ist, wenn die Leiste offen ist.
+fn draw_sidebar_icon(painter: &egui::Painter, c: Pos2, open: bool, color: egui::Color32) {
+    let frame = Rect::from_center_size(c, egui::vec2(14.0, 11.0));
+    let divider = frame.left() + 4.5;
+    if open {
+        let column = Rect::from_min_max(frame.left_top(), egui::pos2(divider, frame.bottom()));
+        painter.rect_filled(column, Rounding { nw: 2.5, sw: 2.5, ..Rounding::ZERO }, color.gamma_multiply(0.6));
+    }
+    let stroke = Stroke::new(ICON_STROKE, color);
+    painter.rect_stroke(frame, 2.5, stroke);
+    painter.line_segment([egui::pos2(divider, frame.top()), egui::pos2(divider, frame.bottom())], stroke);
 }
 
 // ---- Kleine Bausteine ------------------------------------------------------
@@ -996,8 +1069,8 @@ enum Icon {
     Search,
     List,
     Key,
-    Sliders,
-    Lock,
+    Gear,
+    Door,
 }
 
 /// Eintrag der Seitenleiste: 36 px hoch, Symbol links, Text 14 px. Eingeklappt nur das Symbol.
@@ -1006,7 +1079,7 @@ fn nav_button(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str, open: 
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 36.0), Sense::click());
     // Sperren ist im Entwurf rot markiert.
     let color = match icon {
-        Icon::Lock => theme::DANGER,
+        Icon::Door => theme::DANGER,
         _ if selected => theme::TEXT,
         _ => theme::MUTED,
     };
@@ -1031,42 +1104,57 @@ fn nav_button(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str, open: 
     response.on_hover_text(label).clicked()
 }
 
-/// Zeichnet die Symbole des Entwurfs (dort aus CSS-Formen gebaut) mit Linien und Kreisen nach.
+/// Stärke der Linien in allen gezeichneten Symbolen.
+const ICON_STROKE: f32 = 1.25;
+
+/// Navigationssymbole als feine Linienzeichnungen, ca. 12 × 12 px, ohne gefüllte Flächen.
 fn draw_icon(painter: &egui::Painter, icon: Icon, c: Pos2, color: egui::Color32) {
-    let stroke = Stroke::new(1.5, color);
+    let stroke = Stroke::new(ICON_STROKE, color);
     let p = |dx: f32, dy: f32| egui::pos2(c.x + dx, c.y + dy);
     match icon {
         Icon::Search => {
-            painter.circle_stroke(p(-1.0, -1.0), 4.75, stroke);
-            painter.line_segment([p(2.5, 2.5), p(6.5, 6.5)], stroke);
+            painter.circle_stroke(p(-1.0, -1.0), 4.25, stroke);
+            painter.line_segment([p(2.1, 2.1), p(5.5, 5.5)], stroke);
         }
         Icon::List => {
-            for dy in [-4.5, 0.0, 4.5] {
-                painter.line_segment([p(-7.0, dy), p(7.0, dy)], stroke);
+            // Aufzählungspunkte und kürzere Linien wirken leichter als drei volle Balken.
+            for dy in [-4.0, 0.0, 4.0] {
+                painter.circle_filled(p(-5.25, dy), 0.95, color);
+                painter.line_segment([p(-2.75, dy), p(6.0, dy)], stroke);
             }
         }
         Icon::Key => {
-            // Ring, Schaft, zwei Zähne und ein kleiner Funke oben rechts.
-            painter.circle_stroke(p(-3.5, -0.5), 3.5, stroke);
-            painter.line_segment([p(0.0, -0.5), p(7.0, -0.5)], stroke);
-            painter.line_segment([p(4.75, -0.5), p(4.75, 2.5)], stroke);
-            painter.line_segment([p(2.25, -0.5), p(2.25, 1.5)], stroke);
-            let thin = Stroke::new(1.0, color);
-            painter.line_segment([p(8.0, -9.0), p(8.0, -5.0)], thin);
-            painter.line_segment([p(6.0, -7.0), p(10.0, -7.0)], thin);
+            // Ring, Schaft und zwei Zähne.
+            painter.circle_stroke(p(-3.25, 0.0), 2.75, stroke);
+            painter.line_segment([p(-0.5, 0.0), p(6.0, 0.0)], stroke);
+            painter.line_segment([p(4.25, 0.0), p(4.25, 2.5)], stroke);
+            painter.line_segment([p(2.25, 0.0), p(2.25, 1.75)], stroke);
         }
-        Icon::Sliders => {
-            for (dy, knob) in [(-5.5, -1.0), (0.0, 4.0), (5.5, 1.0)] {
-                painter.line_segment([p(-7.0, dy), p(7.0, dy)], stroke);
-                painter.circle_filled(p(knob, dy), 3.0, color);
+        Icon::Gear => {
+            // Zahnrad: 8 Zähne als geschlossener Umriss, innen ein Ring als Nabe.
+            const TEETH: usize = 8;
+            let (outer, inner) = (5.75, 4.25);
+            let step = std::f32::consts::TAU / TEETH as f32;
+            let at = |r: f32, a: f32| p(r * a.cos(), r * a.sin());
+            let mut outline = Vec::with_capacity(TEETH * 4);
+            for k in 0..TEETH {
+                let mid = k as f32 * step;
+                outline.extend([
+                    at(inner, mid - 0.34),
+                    at(outer, mid - 0.2),
+                    at(outer, mid + 0.2),
+                    at(inner, mid + 0.34),
+                ]);
             }
+            painter.add(egui::Shape::closed_line(outline, stroke));
+            painter.circle_stroke(c, 1.9, stroke);
         }
-        Icon::Lock => {
-            let body = Rect::from_center_size(p(0.0, 2.5), egui::vec2(11.0, 9.0));
-            let shackle = Rect::from_min_size(egui::pos2(body.left() + 1.5, body.top() - 6.0), egui::vec2(8.0, 8.0));
-            let rounding = Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 };
-            painter.rect_stroke(shackle, rounding, stroke);
-            painter.rect_filled(body, 2.0, color);
+        Icon::Door => {
+            // Tür mit Knauf auf einer Bodenlinie, die links und rechts übersteht.
+            let door = Rect::from_min_max(p(-3.75, -6.0), p(3.75, 5.5));
+            painter.rect_stroke(door, Rounding { nw: 1.5, ne: 1.5, sw: 0.0, se: 0.0 }, stroke);
+            painter.line_segment([p(-6.0, 5.5), p(6.0, 5.5)], stroke);
+            painter.circle_filled(p(1.6, 0.0), 0.95, color);
         }
     }
 }
@@ -1189,6 +1277,28 @@ fn strength_bars(ui: &mut egui::Ui, pw: &str, bar_width: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_mark_is_32_square() {
+        assert_eq!(title_mark_image().size, [32, 32]);
+    }
+
+    #[test]
+    fn sidebar_starts_collapsed() {
+        assert!(!AegisApp::default().sidebar_open);
+    }
+
+    #[test]
+    fn unlock_texts_cover_all_states() {
+        let t = unlock_texts(true, false);
+        assert_eq!((t.title, t.button), ("Master-Passwort festlegen", "Tresor anlegen"));
+        let t = unlock_texts(true, true);
+        assert_eq!((t.title, t.button), ("Master-Passwort festlegen", "Wird angelegt…"));
+        let t = unlock_texts(false, false);
+        assert_eq!((t.title, t.button), ("Tresor entsperren", "Entsperren"));
+        let t = unlock_texts(false, true);
+        assert_eq!((t.title, t.button), ("Tresor entsperren", "Wird entsperrt…"));
+    }
 
     #[test]
     fn master_policy() {
