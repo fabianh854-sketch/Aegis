@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-app"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "aegis-core",
  "arboard",
@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-core"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
