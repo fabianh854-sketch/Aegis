@@ -1,11 +1,11 @@
 //! Semantische Version `MAJOR.MINOR.PATCH` ohne Zusätze.
 
 use crate::manifest::UpdateError;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
 
 /// Programmversion; die Ableitung der Ordnung folgt der Feldreihenfolge.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Version {
     pub major: u32,
     pub minor: u32,
@@ -43,6 +43,21 @@ impl FromStr for Version {
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Serialisiert als String "MAJOR.MINOR.PATCH".
+impl Serialize for Version {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Liest nur, was `FromStr` akzeptiert (strikt, Objektform wird abgelehnt).
+impl<'de> Deserialize<'de> for Version {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
     }
 }
 
@@ -98,6 +113,42 @@ mod tests {
                 patch: 1
             }
         );
+    }
+
+    #[test]
+    fn version_serializes_as_string() {
+        let v: Version = "0.1.1".parse().unwrap();
+        assert_eq!(serde_json::to_string(&v).unwrap(), "\"0.1.1\"");
+        assert_eq!(serde_json::from_str::<Version>("\"0.1.1\"").unwrap(), v);
+        assert_eq!(serde_json::from_str::<Version>("\"v0.1.1\"").unwrap(), v);
+        for bad in [
+            "\"0.1\"",
+            "\"0.1.1-beta\"",
+            "\"\"",
+            "1",
+            "null",
+            "{\"major\":0,\"minor\":1,\"patch\":1}",
+        ] {
+            assert!(
+                serde_json::from_str::<Version>(bad).is_err(),
+                "{bad} muss abgelehnt werden"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_with_string_versions_roundtrips() {
+        let json = format!(
+            r#"{{"schema":1,"version":"0.1.1","security":false,"min_secure":"0.1.0","issued_at":10,"expires_at":{},"files":[{{"name":"aegis.exe","sha256":"{h}"}},{{"name":"aegis-updater.exe","sha256":"{h}"}}]}}"#,
+            10 + crate::VALIDITY_SECS,
+            h = "a".repeat(64)
+        );
+        let m: crate::Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(m.version.to_string(), "0.1.1");
+        assert_eq!(m.min_secure.to_string(), "0.1.0");
+        assert_eq!(serde_json::to_string(&m).unwrap(), json);
+        let object_form = json.replace("\"0.1.1\"", r#"{"major":0,"minor":1,"patch":1}"#);
+        assert!(serde_json::from_str::<crate::Manifest>(&object_form).is_err());
     }
 
     #[test]
