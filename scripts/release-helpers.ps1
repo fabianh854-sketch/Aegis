@@ -137,3 +137,36 @@ function Get-AegisReleases {
     if ($LASTEXITCODE -ne 0) { throw "Befehl fehlgeschlagen (Exit $LASTEXITCODE): gh api repos/$Repo/releases" }
     return , @(@($lines) | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
 }
+
+function Get-DownloadNotes {
+    <#
+    .SYNOPSIS
+        Erklärt am Anfang der Release-Beschreibung, welche Datei man herunterladen soll.
+        Die übrigen Dateien braucht der eingebaute Updater; sie müssen am Release bleiben.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Tag,
+        [switch]$Security
+    )
+    $zip = "aegis-$Tag-windows-x64.zip"
+    $securityLine = if ($Security) {
+        "> **Sicherheitsupdate:** Bitte zeitnah aktualisieren.`n`n"
+    } else { '' }
+    return @"
+$securityLine## Download
+
+**Zum Installieren brauchst du nur eine Datei: ``$zip``**
+Entpacken und ``aegis.exe`` starten. ``aegis.exe`` und ``aegis-updater.exe`` müssen im selben Ordner bleiben.
+
+| Datei | Wofür |
+|---|---|
+| ``$zip`` | **Die App** – enthält ``aegis.exe``, ``aegis-updater.exe``, README und Lizenzen |
+| ``aegis.exe``, ``aegis-updater.exe`` | Lädt der eingebaute Updater automatisch – nicht von Hand nötig |
+| ``aegis-manifest.json``, ``aegis-manifest.json.minisig`` | Signiertes Manifest für den Updater – nicht von Hand nötig |
+| ``$zip.sha256`` | Prüfsumme der Zip |
+| Source code | Quellcode, von GitHub automatisch erzeugt |
+
+**Schon installiert (ab v0.2.0)?** Nichts herunterladen – Aegis meldet das Update selbst und installiert es per Klick.
+**Echtheit prüfen:** siehe README, Abschnitt „Download prüfen“.
+"@ + "`n`n---`n`n"
+}
