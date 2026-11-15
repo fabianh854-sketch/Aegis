@@ -172,6 +172,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-updater"
+version = "0.1.0"
+dependencies = [
+ "aegis-update",
+ "embed-resource",
+ "minisign",
+ "serde",
+ "serde_json",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

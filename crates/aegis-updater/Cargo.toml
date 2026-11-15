@@ -1,0 +1,18 @@
+[package]
+name = "aegis-updater"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+aegis-update = { path = "../aegis-update" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[dev-dependencies]
+minisign = "0.10"
