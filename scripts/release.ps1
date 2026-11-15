@@ -356,7 +356,10 @@ try {
     $go = Read-Host "Release $Tag jetzt auf GitHub veröffentlichen? (j/n)"
     if ($go -ne 'j') { throw "Nicht veröffentlicht. Die fertigen Dateien liegen unter $upload." }
 
-    Invoke-Native gh (@('release', 'create', $Tag, '--repo', $Repo, '--verify-tag', '--title', "Aegis $Tag", '--generate-notes') + $uploadList)
+    # Download-Hinweis oben, darunter die von GitHub erzeugten Änderungen.
+    $notesFile = Join-Path $Stage 'release-notes.md'
+    Set-Content -Path $notesFile -Value (Get-DownloadNotes -Tag $Tag -Security:$Security) -Encoding utf8NoBOM
+    Invoke-Native gh (@('release', 'create', $Tag, '--repo', $Repo, '--verify-tag', '--title', "Aegis $Tag", '--notes-file', $notesFile, '--generate-notes') + $uploadList)
 
     $published = ((Get-NativeOutput gh @('release', 'view', $Tag, '--repo', $Repo, '--json', 'assets')) -join "`n" | ConvertFrom-Json).assets.name
     foreach ($f in $uploadList | ForEach-Object { Split-Path -Leaf $_ }) {
