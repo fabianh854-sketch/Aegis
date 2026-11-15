@@ -51,7 +51,11 @@ Releases werden **lokal gebaut und signiert**, nicht in GitHub Actions. `.github
 
 ## Download prüfen
 
-Öffentlicher Schlüssel (minisign): `<wird nach dem Erzeugen des Schlüssels eingetragen>`
+Öffentlicher Schlüssel (minisign, Key-ID `C4FE01C4EC24E778`):
+
+```
+RWR45yTsxAH+xHgzb35rEMu0rj9MgdWjFK9okZwflgA5TPikEYDPXK8M
+```
 
 Diesen Schlüssel nur aus dem README im Repository nehmen, nicht von der Release-Seite, damit eine Manipulation dort nicht reicht. So prüfst du einen Download von Hand:
 
