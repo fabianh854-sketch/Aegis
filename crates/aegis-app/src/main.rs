@@ -3,6 +3,7 @@
 mod app;
 mod clipboard;
 mod generator;
+mod task;
 mod theme;
 
 use app::AegisApp;
@@ -16,7 +17,8 @@ fn main() -> eframe::Result {
             .with_inner_size([880.0, 560.0])
             .with_resizable(false)
             .with_decorations(false)
-            .with_transparent(true),
+            .with_transparent(true)
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -28,4 +30,23 @@ fn main() -> eframe::Result {
             Ok(Box::new(AegisApp::default()))
         }),
     )
+}
+
+/// Fenster- und Taskleisten-Icon, eingebettet aus `assets/icon/aegis-256.png` (erzeugt aus `aegis.svg`).
+fn app_icon() -> egui::IconData {
+    // Die Datei ist fest eingebettet; scheitert das Dekodieren, ist der Build kaputt, nicht die Laufzeit.
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/aegis-256.png"))
+        .expect("eingebettetes App-Icon ist ein gültiges PNG")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_icon_is_256_square_rgba() {
+        let icon = app_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 }
