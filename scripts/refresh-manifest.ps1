@@ -36,7 +36,7 @@ function Get-NativeOutput {
     if ($LASTEXITCODE -ne 0) {
         throw "Befehl fehlgeschlagen (Exit $LASTEXITCODE): $Exe $($ArgList -join ' ')"
     }
-    return @($out)
+    return ,@($out)   # Komma: auch bei einer einzigen Zeile ein Array liefern
 }
 
 try {
