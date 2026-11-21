@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aegis – Projektstand</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1e23; --muted: #5d6470; --border: #dfe3e8;
+    --accent: #1f9d55; --accent-bg: #e6f5ec; --warn: #b26a00; --warn-bg: #fff4e0;
+    --danger: #c0392b; --danger-bg: #fdecea; --code-bg: #eef1f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1215; --panel: #161a1f; --text: #e8eaed; --muted: #9aa1ab; --border: #2a2e35;
+      --accent: #5fd08a; --accent-bg: #15291e; --warn: #f0b45a; --warn-bg: #2b2213;
+      --danger: #f08a7e; --danger-bg: #2d1715; --code-bg: #1f242b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.6 "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  h2 { font-size: 19px; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 16px; margin: 0 0 6px; }
+  p { margin: 6px 0; }
+  .sub { color: var(--muted); margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .card.next { border-left: 4px solid var(--accent); }
+  .card.due { border-left: 4px solid var(--warn); }
+  .stat { font-size: 22px; font-weight: 600; }
+  .label { color: var(--muted); font-size: 13px; }
+  .badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; margin-left: 6px; vertical-align: 2px; }
+  .ok { background: var(--accent-bg); color: var(--accent); }
+  .open { background: var(--warn-bg); color: var(--warn); }
+  .risk { background: var(--danger-bg); color: var(--danger); }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  pre { background: var(--code-bg); padding: 10px 12px; border-radius: 8px; overflow-x: auto; font-size: 13px; margin: 8px 0; }
+  ol, ul { padding-left: 22px; margin: 6px 0; }
+  li { margin: 3px 0; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  a { color: var(--accent); }
+  .timeline { position: relative; padding-left: 20px; border-left: 2px solid var(--border); }
+  .timeline .item { margin: 0 0 14px; }
+  .timeline .item::before { content: ""; position: absolute; left: -7px; width: 12px; height: 12px;
+                            border-radius: 50%; background: var(--accent); margin-top: 6px; }
+  .timeline .ver { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Aegis – Projektstand</h1>
+  <p class="sub">Stand: 15.11.2026 · Offline-Passwortmanager für Windows (Rust, egui) · Repository
+    <a href="https://github.com/fabianh854-sketch/Aegis">fabianh854-sketch/Aegis</a> (öffentlich)</p>
+
+  <div class="grid">
+    <div class="card"><div class="label">Aktuelle Version</div><div class="stat">v0.2.0</div>
+      <p>Erstes signiertes Release, Update-Test bestanden</p></div>
+    <div class="card"><div class="label">Tests</div><div class="stat">135 grün</div>
+      <p>Clippy sauber, <code>cargo deny</code> grün</p></div>
+    <div class="card due"><div class="label">Nächste Pflicht</div><div class="stat">bis 22.11.</div>
+      <p>Manifest erneuern (<code>refresh-manifest.ps1</code>)</p></div>
+    <div class="card"><div class="label">Offener PR</div><div class="stat">#5</div>
+      <p><a href="https://github.com/fabianh854-sketch/Aegis/pull/5">Download-Hinweis in Release-Beschreibung</a> – wartet auf deinen Merge</p></div>
+  </div>
+
+  <h2>Wo wir stehen</h2>
+  <div class="timeline">
+    <div class="item"><span class="ver">v0.0.9 – Härtung und Bugfixes</span>
+      <p><code>Session</code> mit gehaltenem Schlüssel, Argon2-Grenzen, atomares Speichern mit Backup, Zwischenablage ohne
+        Windows-Verlauf, Passwortwechsel nur mit altem Passwort, Mindestlänge 12.</p></div>
+    <div class="item"><span class="ver">v0.1.0 – Oberfläche</span>
+      <p>Ersteinrichtung „Master-Passwort festlegen“, Ladeanzeige (Argon2 im Hintergrund), Seitenleiste eingeklappt mit
+        Knopf in der Titelleiste, neu gezeichnete Symbole (Zahnrad, Tür), App-Icon und Mini-Schild.</p></div>
+    <div class="item"><span class="ver">v0.2.0 – Sichere, signierte Updates</span>
+      <p><code>aegis-updater.exe</code> (einziger Teil mit Netz, nur über Windows-<code>curl.exe</code>), signiertes
+        Manifest (minisign), Downgrade-Schutz, kumulativer Sicherheitsstatus, Ablauf nach 7 Tagen, Hinweisleiste in der
+        App, lokale Release-Skripte. Ende-zu-Ende gegen GitHub getestet: Testkopie 0.1.9 fand v0.2.0, prüfte die Signatur,
+        ersetzte beide Dateien und startete neu.</p></div>
+  </div>
+
+  <h2>Wo wir weitermachen</h2>
+  <div class="grid">
+    <div class="card next"><h3>1. PR #5 mergen <span class="badge open">offen</span></h3>
+      <p>Damit künftige Releases oben automatisch erklären, welche Datei man herunterlädt.</p></div>
+    <div class="card due"><h3>2. Wöchentlich Manifest erneuern <span class="badge open">bis 22.11.</span></h3>
+      <p>Sonst zeigt Aegis „Update-Status nicht bestätigt“.</p>
+      <pre>pwsh scripts\refresh-manifest.ps1</pre></div>
+    <div class="card next"><h3>3. Schlüssel absichern <span class="badge risk">wichtig</span></h3>
+      <p><code>%USERPROFILE%\.aegis-signing\aegis.key</code> offline sichern (z. B. USB-Stick), Passwort getrennt
+        aufbewahren. Zwei-Faktor-Anmeldung bei GitHub aktivieren.</p></div>
+    <div class="card next"><h3>4. Konzept Schlüsselverlust <span class="badge open">deine Entscheidung</span></h3>
+      <p>Ersatzschlüssel, Wechselweg, Vorgehen bei Diebstahl. Im Code vorbereitet: <code>TRUSTED_KEYS</code> ist eine Liste.</p></div>
+    <div class="card"><h3>5. egui/eframe-Upgrade <span class="badge open">eigenes Projekt</span></h3>
+      <p>Von 0.29 auf aktuell. Entfernt die beiden Ausnahmen in <code>deny.toml</code> (<code>paste</code>,
+        <code>ttf-parser</code>), bringt aber viele UI-API-Änderungen.</p></div>
+    <div class="card"><h3>6. E-Mail in Commits <span class="badge open">optional</span></h3>
+      <p>Für künftige Commits die GitHub-<code>noreply</code>-Adresse setzen und „Keep my email addresses private“ aktivieren.</p></div>
+  </div>
+
+  <h2>Zurückgestellte Kleinigkeiten</h2>
+  <table>
+    <tr><th>Bereich</th><th>Punkt</th></tr>
+    <tr><td>Updater</td><td>„Aktualisieren“ ohne installierbares Update gibt keine Rückmeldung, wenn die Startprüfung aus ist.</td></tr>
+    <tr><td>Updater</td><td>Fehlermeldung mit Zeitstempel in der Zukunft (falsche Uhr) bleibt sichtbar, bis die Uhr ihn überholt.</td></tr>
+    <tr><td>Updater</td><td>Zweite laufende Aegis-Instanz verhindert das Ersetzen nicht (Windows erlaubt Umbenennen laufender .exe); kein Einzelinstanz-Schutz.</td></tr>
+    <tr><td>Release</td><td>j/n-Abfrage zeigt <code>min_secure</code> vor der Signaturprüfung (wird danach gegengeprüft).</td></tr>
+    <tr><td>Signieren</td><td>Manifest und Signatur werden nacheinander statt atomar geschrieben; Geheimnisse im Speicher nicht genullt (API-Grenze).</td></tr>
+    <tr><td>App</td><td>Hinweisleiste kann bei sehr schmalem Fenster die Knöpfe überlappen.</td></tr>
+    <tr><td>App</td><td>Fenster während des Anlegens schließen kann eine leere, halbe Tresordatei hinterlassen (bewusst so gelassen).</td></tr>
+    <tr><td>Tests</td><td>Kein Test pinnt ausdrücklich die Ablehnung alter (nicht vorgehashter) Signaturen.</td></tr>
+  </table>
+
+  <h2>Wichtige Fakten</h2>
+  <table>
+    <tr><th>Was</th><th>Wert</th></tr>
+    <tr><td>Signaturschlüssel</td><td>minisign, Key-ID <code>C4FE01C4EC24E778</code>, öffentlich in
+      <code>crates/aegis-update/src/keys.rs</code> und README</td></tr>
+    <tr><td>Privater Schlüssel</td><td><code>%USERPROFILE%\.aegis-signing\aegis.key</code> (verschlüsselt, nie committen)</td></tr>
+    <tr><td>Neues Release</td><td>Version in <code>Cargo.toml</code> erhöhen → committen → Tag <code>vX.Y.Z</code> pushen →
+      <code>pwsh scripts\release.ps1 -Version X.Y.Z</code> (bei Sicherheitsupdate <code>-Security</code>)</td></tr>
+    <tr><td>Daten der App</td><td><code>%APPDATA%\Aegis\</code>: <code>vault.aegis</code>, <code>vault.aegis.bak</code>,
+      <code>settings.json</code>, <code>update.json</code></td></tr>
+    <tr><td>Arbeitsordner</td><td>Worktree <code>.claude/worktrees/app-refactor-superpowers-f4717e</code>, Branch
+      <code>claude/app-refactor-superpowers-f4717e</code></td></tr>
+    <tr><td>Design-Dokumente</td><td><code>docs/superpowers/specs/</code> und <code>docs/superpowers/plans/</code></td></tr>
+  </table>
+</main>
+</body>
+</html>

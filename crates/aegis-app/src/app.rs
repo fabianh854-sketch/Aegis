@@ -30,6 +30,13 @@ const SIDEBAR_OPEN_WIDTH: f32 = 220.0;
 const SIDEBAR_CLOSED_WIDTH: f32 = 56.0;
 /// Mindestlänge für neue oder geänderte Master-Passwörter (in Zeichen, nicht Bytes).
 const MIN_MASTER_LEN: usize = 12;
+/// Feste Ids der Master-Passwort-Felder. Ihr egui-Zustand (Undo-Verlauf mit Klartextkopien)
+/// wird über diese Ids gelöscht, sobald die App das Passwort selbst verwirft.
+const UNLOCK_PASSWORD_ID: &str = "unlock_password";
+const UNLOCK_CONFIRM_ID: &str = "unlock_confirm";
+const CURRENT_MASTER_ID: &str = "current_master";
+const NEW_MASTER_ID: &str = "new_master";
+const NEW_MASTER_CONFIRM_ID: &str = "new_master_confirm";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Nav {
@@ -234,7 +241,7 @@ impl AegisApp {
             return;
         };
         if self.session.is_some() {
-            self.lock(); // leert auch die Zwischenablage, falls so eingestellt
+            self.lock(ctx); // leert auch die Zwischenablage, falls so eingestellt
         }
         match updates::spawn_install(&updater) {
             Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -257,7 +264,7 @@ impl eframe::App for AegisApp {
 
         if self.session.is_some() {
             if self.settings.auto_lock && now.duration_since(self.last_activity) >= AUTO_LOCK_AFTER {
-                self.lock();
+                self.lock(ctx);
                 self.set_status("Automatisch gesperrt", false);
             } else {
                 ctx.request_repaint_after(Duration::from_secs(10));
@@ -284,7 +291,7 @@ impl eframe::App for AegisApp {
             match task.poll() {
                 Some(result) => {
                     self.pending = None;
-                    self.finish_unlock(result);
+                    self.finish_unlock(ctx, result);
                 }
                 None => ctx.request_repaint_after(Duration::from_millis(100)),
             }
@@ -359,7 +366,7 @@ impl AegisApp {
         self.status_at = Instant::now();
     }
 
-    fn lock(&mut self) {
+    fn lock(&mut self, ctx: &egui::Context) {
         if self.settings.clear_clipboard {
             self.clipboard.clear_now();
         }
@@ -371,6 +378,11 @@ impl AegisApp {
         self.current_master.zeroize();
         self.new_master.zeroize();
         self.new_master_confirm.zeroize();
+        // Sonst holt Strg+Z im Sperrbildschirm das Master-Passwort aus dem Undo-Verlauf zurück.
+        forget_text_edits(
+            ctx,
+            &[UNLOCK_PASSWORD_ID, UNLOCK_CONFIRM_ID, CURRENT_MASTER_ID, NEW_MASTER_ID, NEW_MASTER_CONFIRM_ID],
+        );
         self.show_master_form = false;
         self.status.clear();
         self.nav = Nav::Entries;
@@ -405,13 +417,13 @@ impl AegisApp {
 
         let label = if first_start { "Master-Passwort (mind. 12 Zeichen)" } else { "Master-Passwort" };
         ui.label(theme::muted(label, 13.0));
-        let first = ui.add_enabled(!busy, password_input(&mut self.password));
+        let first = ui.add_enabled(!busy, password_input(&mut self.password, UNLOCK_PASSWORD_ID));
         let mut enter = first.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
         if first_start {
             ui.add_space(4.0);
             ui.label(theme::muted("Passwort bestätigen", 13.0));
-            let second = ui.add_enabled(!busy, password_input(&mut self.confirm));
+            let second = ui.add_enabled(!busy, password_input(&mut self.confirm, UNLOCK_CONFIRM_ID));
             enter |= second.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         }
         ui.add_space(12.0);
@@ -491,12 +503,13 @@ impl AegisApp {
         ));
     }
 
-    fn finish_unlock(&mut self, result: Result<Session, String>) {
+    fn finish_unlock(&mut self, ctx: &egui::Context, result: Result<Session, String>) {
         match result {
             Ok(session) => {
                 self.session = Some(session);
                 self.password.zeroize();
                 self.confirm.zeroize();
+                forget_text_edits(ctx, &[UNLOCK_PASSWORD_ID, UNLOCK_CONFIRM_ID]);
                 self.nav = Nav::Entries;
                 self.last_activity = Instant::now();
                 self.status.clear();
@@ -572,7 +585,7 @@ impl AegisApp {
         let lock_rect = Rect::from_min_size(egui::pos2(inner.left(), inner.bottom() - 36.0), egui::vec2(lock_width, 36.0));
         let mut lock_ui = ui.new_child(UiBuilder::new().max_rect(lock_rect));
         if nav_button(&mut lock_ui, false, Icon::Door, "Sperren", open) {
-            self.lock();
+            self.lock(lock_ui.ctx());
         }
     }
 
@@ -1024,14 +1037,17 @@ impl AegisApp {
                 theme::card().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
                     ui.add(
-                        password_input(&mut self.current_master)
+                        password_input(&mut self.current_master, CURRENT_MASTER_ID)
                             .hint_text(theme::muted("Aktuelles Master-Passwort", 15.0)),
                     );
                     ui.add(
-                        password_input(&mut self.new_master)
+                        password_input(&mut self.new_master, NEW_MASTER_ID)
                             .hint_text(theme::muted("Neues Master-Passwort (mind. 12 Zeichen)", 15.0)),
                     );
-                    ui.add(password_input(&mut self.new_master_confirm).hint_text(theme::muted("Wiederholen", 15.0)));
+                    ui.add(
+                        password_input(&mut self.new_master_confirm, NEW_MASTER_CONFIRM_ID)
+                            .hint_text(theme::muted("Wiederholen", 15.0)),
+                    );
                     if ui.add(theme::accent_button("Speichern")).clicked() {
                         change_master = true;
                     }
@@ -1062,7 +1078,7 @@ impl AegisApp {
         });
 
         if change_master {
-            self.change_master();
+            self.change_master(ui.ctx());
         }
     }
 
@@ -1077,7 +1093,7 @@ impl AegisApp {
         }
     }
 
-    fn change_master(&mut self) {
+    fn change_master(&mut self, ctx: &egui::Context) {
         if self.current_master.is_empty() {
             self.set_status("Bitte das aktuelle Passwort eingeben", true);
             return;
@@ -1093,10 +1109,12 @@ impl AegisApp {
             &KdfParams::default(),
         );
         self.current_master.zeroize();
+        forget_text_edits(ctx, &[CURRENT_MASTER_ID]);
         match result {
             Ok(outcome) => {
                 self.new_master.zeroize();
                 self.new_master_confirm.zeroize();
+                forget_text_edits(ctx, &[NEW_MASTER_ID, NEW_MASTER_CONFIRM_ID]);
                 self.show_master_form = false;
                 match outcome {
                     MasterChange::Complete => self.set_status("Master-Passwort geändert", false),
@@ -1396,12 +1414,24 @@ fn draw_icon(painter: &egui::Painter, icon: Icon, c: Pos2, color: egui::Color32)
 }
 
 /// Passwortfeld wie im Entwurf: 44 px hoch, Punkte in Monospace.
-fn password_input(text: &mut String) -> egui::TextEdit<'_> {
+/// Die feste `id` erlaubt, den Zustand des Felds später mit [`forget_text_edits`] zu löschen.
+fn password_input<'t>(text: &'t mut String, id: &str) -> egui::TextEdit<'t> {
     egui::TextEdit::singleline(text)
+        .id(egui::Id::new(id))
         .password(true)
         .font(FontId::monospace(16.0))
         .margin(Margin::symmetric(14.0, 12.0))
         .desired_width(f32::INFINITY)
+}
+
+/// Löscht den gespeicherten egui-Zustand dieser Textfelder. Er enthält den Undo-Verlauf mit
+/// Klartextkopien des eingegebenen Texts, die Strg+Z sonst ins leere Feld zurückholt.
+fn forget_text_edits(ctx: &egui::Context, ids: &[&str]) {
+    ctx.data_mut(|data| {
+        for &id in ids {
+            data.remove::<egui::widgets::text_edit::TextEditState>(egui::Id::new(id));
+        }
+    });
 }
 
 /// Schalter im Stil des Entwurfs: 36 × 20, Akzentgrün, wenn aktiv.

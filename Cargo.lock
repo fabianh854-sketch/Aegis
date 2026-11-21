@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aegis-core",
  "aegis-update",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-sign"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aegis-update",
  "minisign",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-update"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "minisign",
  "minisign-verify",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-updater"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aegis-update",
  "embed-resource",

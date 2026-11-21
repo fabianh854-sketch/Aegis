@@ -4,5 +4,5 @@ members = ["crates/aegis-core", "crates/aegis-app", "crates/aegis-update", "crat
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "0.2.1"
 license = "Apache-2.0"
